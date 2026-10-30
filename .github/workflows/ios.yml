@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: "Bundle ID (reuse an existing sideloaded app's App ID)"
+        required: false
+        default: ""
 
 jobs:
   ipa:
@@ -27,6 +32,8 @@ jobs:
         run: npx cap sync ios
 
       - name: Build app (no signing — SideStore signs it on the phone)
+        env:
+          BID: ${{ github.event.inputs.bundle_id }}
         run: |
           xcodebuild -version
           xcodebuild \
@@ -36,6 +43,7 @@ jobs:
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build \
+            ${BID:+PRODUCT_BUNDLE_IDENTIFIER=$BID} \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             build | tail -n 60
           test -d build/Build/Products/Release-iphoneos/App.app
