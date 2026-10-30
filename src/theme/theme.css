@@ -1,0 +1,70 @@
+:root {
+  /* Accent is swappable at runtime via theme.ts */
+  --accent: #229ed9;
+  --accent-ink: #ffffff;
+
+  --radius: 14px;
+  --radius-sm: 9px;
+  --tap: 44px; /* min touch target */
+  --font: "SF Pro", system-ui, -apple-system, "Segoe UI", "IBM Plex Sans Arabic",
+    Roboto, sans-serif;
+
+  /* Safe-area insets for iPhone notch / home indicator */
+  --sat: env(safe-area-inset-top, 0px);
+  --sab: env(safe-area-inset-bottom, 0px);
+}
+
+/* ---- Dark (default) ---- */
+:root,
+[data-theme="dark"] {
+  --bg: #0e1621;
+  --bg-elev: #17212b;
+  --surface: #182533;
+  --surface-2: #202b36;
+  --bubble-in: #182533;
+  --bubble-out: var(--accent);
+  --bubble-out-ink: #ffffff;
+  --text: #e9edf1;
+  --text-dim: #8a98a5;
+  --text-faint: #5c6a76;
+  --border: #0a1119;
+  --danger: #ef5350;
+  --ok: #4fae4e;
+  --shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+}
+
+/* ---- AMOLED pure black ---- */
+[data-theme="amoled"] {
+  --bg: #000000;
+  --bg-elev: #0a0a0a;
+  --surface: #0d0d0d;
+  --surface-2: #151515;
+  --bubble-in: #141414;
+  --bubble-out: var(--accent);
+  --bubble-out-ink: #ffffff;
+  --text: #f2f2f2;
+  --text-dim: #8a8a8a;
+  --text-faint: #595959;
+  --border: #000000;
+  --danger: #ef5350;
+  --ok: #4fae4e;
+  --shadow: 0 6px 24px rgba(0, 0, 0, 0.8);
+}
+
+/* ---- Light ---- */
+[data-theme="light"] {
+  --bg: #e7ebf0;
+  --bg-elev: #ffffff;
+  --surface: #ffffff;
+  --surface-2: #f1f4f7;
+  --bubble-in: #ffffff;
+  --bubble-out: #e3f2e1;
+  --bubble-out-ink: #0b0f14;
+  --text: #0b0f14;
+  --text-dim: #707b86;
+  --text-faint: #9aa4ad;
+  --border: #d3dae1;
+  --danger: #d1453b;
+  --ok: #3a8c39;
+  --shadow: 0 6px 24px rgba(0, 0, 0, 0.12);
+}
