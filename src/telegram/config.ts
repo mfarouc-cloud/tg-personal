@@ -1,9 +1,12 @@
-// Persists the API credentials and the MTProto session(s) in localStorage.
+// Persists the API credentials and the MTProto session(s) in secure storage
+// (iOS Keychain in the app, localStorage only in the browser dev build).
 // api_id / api_hash come from https://my.telegram.org (API development tools).
 //
 // Multiple accounts: each account lives in a numbered "slot" with its own
 // session. Slot "0" keeps the original key ("tg.session") so existing logins
 // survive the upgrade.
+
+import { sget, sset, sremove, sclear } from "./secureStore";
 
 const K_API_ID = "tg.apiId";
 const K_API_HASH = "tg.apiHash";
@@ -24,8 +27,8 @@ export interface AccountMeta {
 }
 
 export function loadCredentials(): ApiCredentials | null {
-  const idRaw = localStorage.getItem(K_API_ID);
-  const hash = localStorage.getItem(K_API_HASH);
+  const idRaw = sget(K_API_ID);
+  const hash = sget(K_API_HASH);
   if (!idRaw || !hash) return null;
   const apiId = Number(idRaw);
   if (!Number.isFinite(apiId) || apiId <= 0) return null;
@@ -33,8 +36,8 @@ export function loadCredentials(): ApiCredentials | null {
 }
 
 export function saveCredentials(creds: ApiCredentials): void {
-  localStorage.setItem(K_API_ID, String(creds.apiId));
-  localStorage.setItem(K_API_HASH, creds.apiHash.trim());
+  sset(K_API_ID, String(creds.apiId));
+  sset(K_API_HASH, creds.apiHash.trim());
 }
 
 export function hasCredentials(): boolean {
@@ -43,22 +46,22 @@ export function hasCredentials(): boolean {
 
 // ---------------- slots ----------------
 export function currentSlot(): string {
-  return localStorage.getItem(K_SLOT) || "0";
+  return sget(K_SLOT) || "0";
 }
 
 const sessionKey = (slot: string) => (slot === "0" ? "tg.session" : `tg.session.${slot}`);
 
 export function loadSession(): string {
-  return localStorage.getItem(sessionKey(currentSlot())) ?? "";
+  return sget(sessionKey(currentSlot())) ?? "";
 }
 
 export function saveSession(value: string): void {
-  localStorage.setItem(sessionKey(currentSlot()), value);
+  sset(sessionKey(currentSlot()), value);
 }
 
 export function listAccounts(): AccountMeta[] {
   try {
-    const list = JSON.parse(localStorage.getItem(K_ACCOUNTS) || "[]") as AccountMeta[];
+    const list = JSON.parse(sget(K_ACCOUNTS) || "[]") as AccountMeta[];
     return Array.isArray(list) ? list : [];
   } catch {
     return [];
@@ -66,7 +69,7 @@ export function listAccounts(): AccountMeta[] {
 }
 
 function writeAccounts(list: AccountMeta[]): void {
-  localStorage.setItem(K_ACCOUNTS, JSON.stringify(list));
+  sset(K_ACCOUNTS, JSON.stringify(list));
 }
 
 /** Record who is signed in on the current slot (called after getMe). */
@@ -84,23 +87,23 @@ export function startNewAccount(): void {
   used.add(Number(currentSlot()));
   let n = 0;
   while (used.has(n)) n++;
-  localStorage.setItem(K_SLOT, String(n));
-  localStorage.removeItem(sessionKey(String(n)));
+  sset(K_SLOT, String(n));
+  sremove(sessionKey(String(n)));
 }
 
 export function switchAccount(slot: string): void {
-  localStorage.setItem(K_SLOT, slot);
+  sset(K_SLOT, slot);
 }
 
 /** Forget the current account; returns the slot to switch to (or null if none left). */
 export function removeCurrentAccount(): string | null {
   const slot = currentSlot();
-  localStorage.removeItem(sessionKey(slot));
+  sremove(sessionKey(slot));
   const rest = listAccounts().filter((a) => a.slot !== slot);
   writeAccounts(rest);
   const next = rest[0]?.slot ?? null;
-  if (next) localStorage.setItem(K_SLOT, next);
-  else localStorage.removeItem(K_SLOT);
+  if (next) sset(K_SLOT, next);
+  else sremove(K_SLOT);
   return next;
 }
 
@@ -110,19 +113,12 @@ export function cancelNewAccount(): boolean {
   if (listAccounts().some((a) => a.slot === slot)) return false;
   const back = listAccounts()[0]?.slot;
   if (!back) return false;
-  localStorage.removeItem(sessionKey(slot));
-  localStorage.setItem(K_SLOT, back);
+  sremove(sessionKey(slot));
+  sset(K_SLOT, back);
   return true;
 }
 
 /** Wipe everything (last account logged out). */
-export function clearAll(): void {
-  localStorage.removeItem(K_API_ID);
-  localStorage.removeItem(K_API_HASH);
-  for (let i = localStorage.length - 1; i >= 0; i--) {
-    const key = localStorage.key(i);
-    if (key && (key === "tg.session" || key.startsWith("tg.session.") || key === K_ACCOUNTS || key === K_SLOT)) {
-      localStorage.removeItem(key);
-    }
-  }
+export function clearAll(): Promise<void> {
+  return sclear();
 }

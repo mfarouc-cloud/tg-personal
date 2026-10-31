@@ -222,6 +222,35 @@ class TG {
    * calls file.arrayBuffer() on the whole file, which breaks at multi-GB).
    * Returns an InputFile handle that sendFile accepts.
    */
+  /** True while an upload is paused waiting for connection / foreground. */
+  uploadStalled = false;
+
+  /** Resolves once the app is in the foreground and MTProto is connected again. */
+  private waitResumable(signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const check = () => {
+        if (signal?.aborted) {
+          cleanup();
+          reject(new Error("CANCELLED"));
+        } else if (document.visibilityState === "visible" && this.state === "connected") {
+          cleanup();
+          resolve();
+        } else if (document.visibilityState === "visible" && this.state === "disconnected") {
+          void this.connect().catch(() => {});
+        }
+      };
+      const timer = window.setInterval(check, 2000);
+      const off = this.on("connState", check);
+      document.addEventListener("visibilitychange", check);
+      const cleanup = () => {
+        clearInterval(timer);
+        (off as any)?.();
+        document.removeEventListener("visibilitychange", check);
+      };
+      check();
+    });
+  }
+
   async uploadLarge(
     file: File,
     onProgress?: (ratio: number) => void,
@@ -250,9 +279,23 @@ class TG {
                 : new Api.upload.SaveFilePart({ fileId, filePart: part, bytes }),
             );
             break;
-          } catch (e) {
-            if (attempt >= 3 || signal?.aborted) throw e;
-            await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+          } catch (e: any) {
+            if (signal?.aborted) throw e;
+            const msg = String(e?.errorMessage || e?.message || "");
+            const flood = /FLOOD_WAIT_(\d+)/.exec(msg) || (e?.seconds ? [, String(e.seconds)] : null);
+            if (flood) {
+              await new Promise((r) => setTimeout(r, (Number(flood[1]) + 1) * 1000));
+              continue;
+            }
+            // Hard API errors (bad part, file too big…) are final.
+            if (/^[A-Z0-9_]+$/.test(msg) && !/TIMEOUT|CONNECTION|NETWORK/.test(msg) && attempt >= 3) throw e;
+            // Network loss / app sent to background (iOS suspends the WebView and
+            // drops the socket): wait until the app is visible + reconnected, then
+            // re-send this same part with the same fileId so the upload resumes.
+            this.uploadStalled = true;
+            await this.waitResumable(signal);
+            this.uploadStalled = false;
+            await new Promise((r) => setTimeout(r, Math.min(1000 * (attempt + 1), 5000)));
           }
         }
         onProgress?.(++done / total);

@@ -321,6 +321,25 @@ else if (screen === "insight") {
   (window as any).opened = opened;
   await renderUserInsight(u, { onBack: () => {}, onOpenChat: (d: any, j?: number) => opened.push([d.title || d.entity?.title, j]) });
 }
+else if (screen === "upload") {
+  // Simulates an upload interrupted by the app going to background / socket drop.
+  const t: any = tg;
+  const seen: number[] = [];
+  let failNext = 3;
+  t.me = { premium: false };
+  t.state = "connected";
+  t.client = { invoke: async (req: any) => {
+    if (req.filePart === 2 && failNext > 0) { failNext--; t.state = "disconnected"; throw new Error("Connection closed"); }
+    seen.push(req.filePart); return true;
+  } };
+  t.connect = async () => {};
+  (window as any).result = { done: false };
+  const file = new File([new Uint8Array(5 * 512 * 1024)], "v.mp4");
+  const p = tg.uploadLarge(file, () => {}).then((r: any) => ((window as any).result = { done: true, parts: r.parts, seen: [...seen].sort() }));
+  (window as any).reconnect = () => { t.state = "connected"; t.emit?.("connState", "connected"); };
+  (window as any).stalled = () => tg.uploadStalled;
+  void p;
+}
 else if (screen === "chat") {
   (tg as any).getHistory = async () => [
     { id: 2, out: true, date: Math.floor(Date.now() / 1000), message: "تمام، اتفقنا" },

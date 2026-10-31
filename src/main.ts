@@ -22,6 +22,7 @@ import { renderContacts, renderCreateGroup, createChannel, openByLink, openInvit
 import type { Dialog } from "./telegram/types";
 import { isOn } from "./features/registry";
 import { hasPasscode, renderLock } from "./features/passcode";
+import { initSecureStore } from "./telegram/secureStore";
 
 applyTheme();
 
@@ -215,5 +216,12 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
-if (locked()) renderLock(() => boot());
-else boot();
+// Secrets (API keys, sessions, passcode) are loaded from the iOS Keychain
+// before anything reads them.
+void initSecureStore()
+  .then((r) => r.migrated && console.info(`[secureStore] migrated ${r.migrated} secrets to ${r.backend}`))
+  .catch((e) => console.error("[secureStore] init failed", e))
+  .finally(() => {
+    if (locked()) renderLock(() => boot());
+    else boot();
+  });

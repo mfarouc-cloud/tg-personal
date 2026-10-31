@@ -374,11 +374,20 @@ export function renderChat(dialog: Dialog, nav: ChatNav, opts: { jumpTo?: number
     p.node.querySelector(".upload-row")!.append(
       el("button", { class: "media-save", text: "✕", "aria-label": "إلغاء", onclick: () => ctrl.abort() }),
     );
+    // Show when iOS paused the upload (app in background / no network).
+    const pctEl = p.node.querySelector(".upload-row") as HTMLElement;
+    const stallNote = el("div", { class: "hint", text: "" });
+    pctEl.after(stallNote);
+    const stallTimer = window.setInterval(() => {
+      stallNote.textContent = tg.uploadStalled ? "⏸ الرفع متوقف — هيكمل لوحده لما التطبيق يكون مفتوح والنت شغال" : "";
+    }, 1000);
     try {
       const m = await tg.sendFile(peer, file, { caption: caption || undefined, signal: ctrl.signal, onProgress: p.set, replyTo: replyTo ?? topId, topMsgId: topId });
+      clearInterval(stallTimer);
       p.node.remove();
       addLive(m);
     } catch (e: any) {
+      clearInterval(stallTimer);
       p.node.remove();
       toast(ctrl.signal.aborted ? "اتلغى الرفع" : "تعذّر الإرسال: " + (e?.errorMessage || e?.message || ""));
     }

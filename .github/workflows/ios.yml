@@ -48,6 +48,15 @@ jobs:
             build | tail -n 60
           test -d build/Build/Products/Release-iphoneos/App.app
 
+      - name: Verify bundle (plugins + Keychain + no leftover secrets code path)
+        run: |
+          APP=build/Build/Products/Release-iphoneos/App.app
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP/Info.plist"
+          (strings "$APP/App"; find "$APP/Frameworks" -type f -exec strings {} +) | grep -q "SecureStorage" && echo "SecureStorage plugin linked" || { echo "::error::SecureStorage plugin not found in binary"; exit 1; }
+          grep -lq "tgp_" "$APP"/public/assets/*.js && echo "Keychain prefix present in JS" || { echo "::error::secureStore missing"; exit 1; }
+          codesign -dv "$APP" 2>&1 | head -3 || true
+
       - name: Package IPA
         run: |
           mkdir -p Payload

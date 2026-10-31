@@ -1,3 +1,4 @@
+import { safeReload } from "../telegram/secureStore";
 import { el, mount, toast } from "./dom";
 import { tg } from "../telegram/client";
 import { clearAll, listAccounts, currentSlot, switchAccount, startNewAccount, removeCurrentAccount } from "../telegram/config";
@@ -30,7 +31,7 @@ export interface SettingsNav {
   onBack: () => void;
 }
 
-const VERSION = "0.8.0";
+const VERSION = "0.9.0";
 
 export function renderSettings(nav: SettingsNav): void {
   const back = () => renderSettings(nav);
@@ -74,7 +75,7 @@ export function renderSettings(nav: SettingsNav): void {
           ? null
           : () => {
               switchAccount(a.slot);
-              location.reload();
+              void safeReload();
             },
       }, [
         el("div", { class: "text" }, [el("div", { class: "label", text: a.name || "حساب" }), el("div", { class: "desc", dir: "ltr", text: a.phone ? "+" + a.phone : "" })]),
@@ -85,7 +86,7 @@ export function renderSettings(nav: SettingsNav): void {
   body.append(
     navRow("➕ إضافة حساب", "كل حساب ليه جلسة لوحده على الجهاز ده", () => {
       startNewAccount();
-      location.reload();
+      void safeReload();
     }),
   );
 
@@ -175,10 +176,10 @@ export function renderSettings(nav: SettingsNav): void {
       }
       const next = removeCurrentAccount();
       if (!next) {
-        clearAll();
         clearPasscode();
+        await clearAll();
       }
-      location.reload();
+      void safeReload();
     } }, [el("div", { class: "label danger-text", text: "🚪 تسجيل الخروج" })]),
   );
   body.append(el("div", { class: "section", text: `نسخة ${VERSION} — عميل شخصي. المكالمات والمحادثات السرّية غير مدعومة في نسخة الويب.` }));

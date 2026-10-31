@@ -1,8 +1,9 @@
 // App passcode lock. Stores only a salted SHA-256 of the PIN, never the PIN.
 // Note: this is a privacy screen against someone picking up the device — the
-// session itself still lives in localStorage on this browser.
+// session lives in the iOS Keychain (localStorage only in the browser dev build).
 import { el, mount } from "../ui/dom";
 
+import { sget, sset, sremove } from "../telegram/secureStore";
 const K_HASH = "tg.passcode.hash";
 const K_SALT = "tg.passcode.salt";
 const PIN_LEN = 4;
@@ -14,24 +15,24 @@ async function hashPin(pin: string, salt: string): Promise<string> {
 }
 
 export function hasPasscode(): boolean {
-  return !!localStorage.getItem(K_HASH);
+  return !!sget(K_HASH);
 }
 
 export async function setPasscode(pin: string): Promise<void> {
   const saltBytes = crypto.getRandomValues(new Uint8Array(16));
   const salt = Array.from(saltBytes, (b) => b.toString(16).padStart(2, "0")).join("");
-  localStorage.setItem(K_SALT, salt);
-  localStorage.setItem(K_HASH, await hashPin(pin, salt));
+  sset(K_SALT, salt);
+  sset(K_HASH, await hashPin(pin, salt));
 }
 
 export function clearPasscode(): void {
-  localStorage.removeItem(K_HASH);
-  localStorage.removeItem(K_SALT);
+  sremove(K_HASH);
+  sremove(K_SALT);
 }
 
 async function verify(pin: string): Promise<boolean> {
-  const salt = localStorage.getItem(K_SALT) ?? "";
-  return (await hashPin(pin, salt)) === localStorage.getItem(K_HASH);
+  const salt = sget(K_SALT) ?? "";
+  return (await hashPin(pin, salt)) === sget(K_HASH);
 }
 
 /** Keypad screen. `onPin` returns true to accept, false to shake & retry. */

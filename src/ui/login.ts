@@ -1,3 +1,4 @@
+import { safeReload } from "../telegram/secureStore";
 import { el, mount } from "./dom";
 import { tg } from "../telegram/client";
 import { loadCredentials, saveCredentials, listAccounts, currentSlot, cancelNewAccount } from "../telegram/config";
@@ -19,7 +20,7 @@ export function renderLogin(onDone: () => void): void {
       ...(adding ? [el("p", { class: "hint", text: "إضافة حساب جديد" })] : []),
       card,
       ...(adding
-        ? [el("button", { class: "btn secondary", text: "إلغاء والرجوع لحسابك", onclick: () => cancelNewAccount() && location.reload() })]
+        ? [el("button", { class: "btn secondary", text: "إلغاء والرجوع لحسابك", onclick: () => cancelNewAccount() && void safeReload() })]
         : []),
     ]),
   ]);
