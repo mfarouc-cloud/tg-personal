@@ -23,6 +23,7 @@ import type { Dialog } from "./telegram/types";
 import { isOn } from "./features/registry";
 import { hasPasscode, renderLock } from "./features/passcode";
 import { initSecureStore } from "./telegram/secureStore";
+import { resolveTarget } from "./features/linkResolver";
 
 applyTheme();
 
@@ -98,13 +99,11 @@ function openInsight(user: any, back: () => void): void {
 
 /** Open a chat from @username, t.me link, numeric user id, or "+inviteHash". */
 async function openPeer(target: string, postId?: number): Promise<void> {
-  if (target.startsWith("+")) return openInvite(target.slice(1), { onOpenChat: (d) => openChat(d) });
-  try {
-    const entity: any = await tg.getEntity(/^\d+$/.test(target) ? target : target.replace(/^@/, ""));
-    openChat(dialogFor(entity), postId);
-  } catch {
-    toast("مش لاقي " + target);
-  }
+  const r = await resolveTarget(target);
+  if (r.type === "invite") return openInvite(r.hash, { onOpenChat: (d) => openChat(d) });
+  if (r.type === "fail") return toast(r.reason);
+  if (r.note) toast(r.note);
+  openChat(dialogFor(r.entity), postId);
 }
 
 function openSettings(): void {

@@ -17,8 +17,8 @@ export default defineConfig({
       registerType: "autoUpdate",
       includeAssets: ["icons/*.png", "favicon.svg"],
       manifest: {
-        name: "Telegram Personal",
-        short_name: "TG",
+        name: "HBOLT",
+        short_name: "HBOLT",
         description: "Personal Telegram client with power features",
         lang: "ar",
         dir: "rtl",

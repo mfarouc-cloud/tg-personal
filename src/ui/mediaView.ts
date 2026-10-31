@@ -16,6 +16,7 @@ import {
 } from "../features/media";
 import { isOn } from "../features/registry";
 import { tg } from "../telegram/client";
+import { enableZoom } from "../features/zoom";
 import { playTgs } from "../features/premiumMedia";
 
 const ICON: Record<MediaInfo["kind"], string> = {
@@ -126,9 +127,24 @@ export function renderMedia(
     case "video":
     case "gif":
     case "videoNote": {
-      const frame = el("button", { class: "media-frame", "aria-label": LABEL[info.kind] }, [
-        el("span", { class: "media-ph", text: "▶ " + meta }),
+      const frame = el("button", { class: "media-frame video-thumb", "aria-label": LABEL[info.kind] }, [
+        el("span", { class: "play-badge", text: "▶" }),
+        el("span", { class: "dur-badge", text: meta }),
       ]);
+      // Inline preview: Telegram's server-side thumbnail (fast, tiny download).
+      void (async () => {
+        for (const t of [1, 0]) {
+          try {
+            const th = await tg.downloadMedia(msg, { thumb: t });
+            if (th && th.length > 200) {
+              frame.style.backgroundImage = `url(${URL.createObjectURL(new Blob([th as unknown as BlobPart], { type: "image/jpeg" }))})`;
+              return;
+            }
+          } catch {
+            /* try next size */
+          }
+        }
+      })();
       frame.onclick = async () => {
         try {
           const { url } = await load();
@@ -300,9 +316,12 @@ function openViewer(msg: Api.Message, info: MediaInfo, url: string, chatEntity?:
       }),
     );
   }
+  const img = el("img", { src: url, alt: "", decoding: "async" });
+  enableZoom(img);
   const overlay = el("div", { class: "viewer", onclick: (e: Event) => e.target === overlay && close() }, [
     actions,
-    el("img", { src: url, alt: "" }),
+    el("div", { class: "viewer-stage" }, [img]),
+    el("div", { class: "hint viewer-hint", text: "قرّب بإصبعين أو دبل تاب" }),
   ]);
   document.body.append(overlay);
   window.addEventListener("keydown", onKey);

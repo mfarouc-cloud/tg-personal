@@ -7,6 +7,7 @@ import { avatarEl } from "../avatar";
 import { tg, peerKey } from "../../telegram/client";
 import type { Dialog } from "../../telegram/types";
 import { isOn } from "../../features/registry";
+import { recordSeen } from "../../features/seenIndex";
 import { openForwardPicker } from "../forward";
 import { premiumStar } from "../chatlist";
 import { buildBubble, pill, dayLabel, snippetOf, myReactions, type Bubble, type BubbleCtx } from "./bubble";
@@ -73,11 +74,97 @@ export function renderChat(dialog: Dialog, nav: ChatNav, opts: { jumpTo?: number
     avatar,
     el("div", { class: "chat-meta" }, [titleEl, subtitle]),
   ]);
+  const moreBtn = el("button", { class: "iconbtn", text: "⋮", "aria-label": "إجراءات سريعة", onclick: () => void quickActions() });
   const topbar = el("div", { class: "topbar" }, [
     el("button", { class: "iconbtn", text: "‹", "aria-label": "رجوع", onclick: () => leave() }),
     headInfo,
     searchBtn,
+    moreBtn,
   ]);
+  // ---------- Selection mode (bulk select / forward) ----------
+  let selecting = false;
+  const selected = new Set<number>();
+  const selCount = el("div", { class: "title", text: "" });
+  const selBar = el("div", { class: "topbar selbar", style: { display: "none" } }, [
+    el("button", { class: "iconbtn", text: "✕", "aria-label": "إلغاء التحديد", onclick: () => exitSelect() }),
+    selCount,
+    el("button", { class: "btn small", text: "🖼 الميديا", onclick: () => selectAll(true) }),
+    el("button", { class: "btn small", text: "اختيار الكل", onclick: () => selectAll(false) }),
+    el("button", { class: "btn small primary", text: "↪ توجيه", onclick: () => forwardSelected() }),
+  ]);
+  const paintSel = () => {
+    selCount.textContent = `${selected.size} محدد`;
+    for (const [id, it] of items) if (it.kind === "msg") it.bubble.node.classList.toggle("selected", selected.has(id));
+  };
+  function enterSelect(first?: number) {
+    selecting = true;
+    if (first != null) selected.add(first);
+    topbar.style.display = "none";
+    selBar.style.display = "";
+    screen.classList.add("selecting");
+    paintSel();
+  }
+  function exitSelect() {
+    selecting = false;
+    selected.clear();
+    selBar.style.display = "none";
+    topbar.style.display = "";
+    screen.classList.remove("selecting");
+    paintSel();
+  }
+  function selectAll(mediaOnly: boolean) {
+    for (const [id, it] of items) {
+      if (it.kind !== "msg") continue;
+      const m: any = it.bubble.msg;
+      if (!mediaOnly || (m.media && !(m.media instanceof Api.MessageMediaWebPage))) selected.add(id);
+    }
+    paintSel();
+  }
+  function forwardSelected() {
+    const msgs = [...selected].map((id) => items.get(id)).filter((it): it is any => it?.kind === "msg").map((it) => it.bubble.msg);
+    if (!msgs.length) return toast("حدد رسايل الأول");
+    openForwardPicker(msgs, dialog, () => exitSelect());
+  }
+  async function quickActions() {
+    const ent: any = entity;
+    const isChan = ent instanceof Api.Channel;
+    const member = !(isChan && ent.left);
+    const muted = isMutedDialog();
+    const opts: { label: string; value: string; danger?: boolean }[] = [
+      { label: "☑ تحديد رسايل", value: "select" },
+      { label: muted ? "🔔 إلغاء الكتم" : "🔇 كتم", value: "mute" },
+      { label: "🔍 بحث", value: "search" },
+      { label: "ℹ️ المعلومات", value: "info" },
+    ];
+    if (isChan && !member) opts.push({ label: "➕ انضمام", value: "join" });
+    if ((isChan || ent instanceof Api.Chat) && member) opts.push({ label: isBroadcast ? "🚪 مغادرة القناة" : "🚪 خروج من الجروب", value: "leave", danger: true });
+    const v = await askChoice(name, opts);
+    try {
+      if (v === "select") enterSelect();
+      else if (v === "search") searchBtn.click();
+      else if (v === "info") headInfo.click();
+      else if (v === "mute") {
+        await tg.setMuteUntil(ent, muted ? 0 : 2147483647);
+        (dialog as any).dialog = { ...(dialog as any).dialog, notifySettings: { muteUntil: muted ? 0 : 2147483647 } };
+        toast(muted ? "اتلغى الكتم" : "اتكتمت");
+      } else if (v === "join") {
+        await tg.joinChannel(ent);
+        toast("انضميت ✓");
+        nav.onReopen?.();
+      } else if (v === "leave") {
+        if (!(await askChoice(`متأكد إنك عايز تخرج من ${name}؟`, [{ label: "خروج", value: "y", danger: true }]))) return;
+        await tg.leave(ent);
+        toast("خرجت");
+        leave();
+      }
+    } catch (e: any) {
+      toast("تعذّر: " + (e?.errorMessage || e?.message || ""));
+    }
+  }
+  function isMutedDialog(): boolean {
+    const mu = (dialog as any).dialog?.notifySettings?.muteUntil;
+    return !!mu && mu > Date.now() / 1000;
+  }
 
   const composer = createComposer(peer, {
     sendText: async (text, replyTo) => {
@@ -108,7 +195,7 @@ export function renderChat(dialog: Dialog, nav: ChatNav, opts: { jumpTo?: number
     openWebApp: (url) => void openWebApp(null, url, true),
   });
 
-  const screen = el("div", { class: "screen" }, [topbar, pinnedBar, scroller, fab, composer.root]);
+  const screen = el("div", { class: "screen chat-screen" }, [topbar, selBar, pinnedBar, scroller, fab, composer.root]);
   mount(screen);
   {
     const reason = readOnlyReason();
@@ -268,11 +355,25 @@ export function renderChat(dialog: Dialog, nav: ChatNav, opts: { jumpTo?: number
       return node;
     }
     if (!(m instanceof Api.Message)) return null;
+    const fromU = (m as any).fromId;
+    if (fromU instanceof Api.PeerUser && !(entity instanceof Api.User)) recordSeen(String(fromU.userId), peerKey(entity), name, m.date);
     const b = buildBubble(m, bubbleCtx);
     b.node.dataset.date = String(m.date);
     const gid = (m as any).groupedId;
     if (gid) b.node.dataset.group = String(gid);
-    attachLongPress(b.node, (x, y) => openMsgMenu(b, x, y));
+    attachLongPress(b.node, (x, y) => (selecting ? null : openMsgMenu(b, x, y)));
+    b.node.addEventListener(
+      "click",
+      (e) => {
+        if (!selecting) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (selected.has(m.id)) selected.delete(m.id);
+        else selected.add(m.id);
+        paintSel();
+      },
+      true,
+    );
     items.set(m.id, { kind: "msg", bubble: b });
     return b.node;
   }
@@ -695,6 +796,7 @@ export function renderChat(dialog: Dialog, nav: ChatNav, opts: { jumpTo?: number
           }
         : undefined,
     });
+    list.splice(Math.min(1, list.length), 0, { label: "☑ تحديد", run: () => enterSelect(m.id) });
     openMenu(x, y, list, { onPick: (e) => void toggleReaction(m, e), mine: myReactions(m) });
   }
 

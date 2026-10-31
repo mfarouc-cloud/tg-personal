@@ -1,7 +1,20 @@
-# CHECKPOINT — tg-personal (v0.9.0)
+# CHECKPOINT — HBOLT (v1.0.0, formerly tg-personal)
 
 Personal Telegram client: TypeScript + Vite + teleproto (MTProto over WebSocket),
 wrapped as an iOS app with Capacitor 8 (SPM). Repo: `mfarouc-cloud/tg-personal`.
+
+## Done in v1.0.0 (HBOLT)
+| Area | Change | Files |
+|---|---|---|
+| Rebrand | Display name / titles / PWA manifest → HBOLT | `capacitor.config.ts`, `ios/App/App/Info.plist`, `index.html`, `vite.config.ts`, `src/ui/chatlist.ts`, `src/ui/settings.ts` |
+| Bulk select + safe forward | ⋮ → "تحديد رسايل" or long-press → "☑ تحديد"; "🖼 الميديا" / "اختيار الكل"; forward queue: batches of 10 ids, 2 s apart, FLOOD_WAIT/SLOWMODE honoured, cancellable | `src/features/bulkForward.ts`, `src/ui/forward.ts`, `src/ui/chat/view.ts`, `client.forwardMany` |
+| Header quick actions | ⋮ in chat header: select, mute/unmute, search, info, join, leave | `src/ui/chat/view.ts` |
+| Media | Pinch / double-tap zoom + pan viewer; video thumbnails with duration badge | `src/features/zoom.ts`, `src/ui/mediaView.ts` |
+| Member details | Local on-device "seen in" index adds chats not returned by getCommonChats | `src/features/seenIndex.ts`, `src/ui/userInsight.ts` |
+| Smart links | Cache of resolved links; expired invite → previously resolved chat; `t.me/c/<id>/<post>` | `src/features/linkResolver.ts`, `src/main.ts`, `src/ui/chat/format.ts` |
+| Power tools | "🔵 غير المقروء" filter, "✓ تعليم كمقروء" (throttled, respects ghost mode) | `src/features/powerTools.ts`, `src/ui/chatlist.ts` |
+| UI | Screen transitions, blurred top bars, rounded bubbles, selection styling (reduced-motion aware) | `src/style.css` |
+| Signing in CI | Workflow signs with your cert when repo secrets `SIGN_P12_BASE64`, `SIGN_P12_PASSWORD`, `SIGN_PROFILE_BASE64` exist; minimal entitlements | `.github/workflows/ios.yml` |
 
 ## Done in v0.9.0
 | Area | Change | Files |

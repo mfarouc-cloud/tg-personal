@@ -5,7 +5,8 @@
 // groups you're not in.
 import { Api } from "teleproto";
 import { el, mount, toast, fmtTime } from "./dom";
-import { tg } from "../telegram/client";
+import { tg, peerKey } from "../telegram/client";
+import { seenFor } from "../features/seenIndex";
 import { realName, dialogFor } from "../telegram/entity";
 import type { Dialog } from "../telegram/types";
 import { avatarEl } from "./avatar";
@@ -225,6 +226,31 @@ export async function renderUserInsight(userIn: any, nav: InsightNav): Promise<v
     }
   };
   await Promise.all([worker(), worker(), worker()]);
+  // Chats from the local "seen in" index that common-chats didn't return.
+  const commonKeys = new Set(chats.map((c) => peerKey(c)));
+  const extra = seenFor(String(user.id)).filter((x) => !commonKeys.has(x.chatKey));
+  if (extra.length) {
+    groupsBox.append(el("div", { class: "hint pad", text: "شوفته قبل كده في (من سجل الجهاز):" }));
+    for (const x of extra) {
+      groupsBox.append(
+        el("div", {
+          class: "chat-row",
+          onclick: async () => {
+            try {
+              nav.onOpenChat(dialogFor(await tg.getEntity(x.chatKey)));
+            } catch {
+              toast("المحادثة دي مبقتش متاحة");
+            }
+          },
+        }, [
+          el("div", { class: "chat-meta" }, [
+            el("div", { class: "chat-name", text: x.title }),
+            el("div", { class: "chat-last", text: "آخر رسالة شفتها: " + fmtDate(x.at, false) }),
+          ]),
+        ]),
+      );
+    }
+  }
   if (!ownedCount) ownedBox.append(el("div", { class: "muted pad", text: "مش مالك ولا أدمن في أي مكان مشترك معاك" }));
 
   all.sort((a, b) => b.m.date - a.m.date);

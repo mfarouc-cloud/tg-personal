@@ -31,7 +31,7 @@ export interface SettingsNav {
   onBack: () => void;
 }
 
-const VERSION = "0.9.0";
+const VERSION = "1.0.0";
 
 export function renderSettings(nav: SettingsNav): void {
   const back = () => renderSettings(nav);
@@ -182,7 +182,7 @@ export function renderSettings(nav: SettingsNav): void {
       void safeReload();
     } }, [el("div", { class: "label danger-text", text: "🚪 تسجيل الخروج" })]),
   );
-  body.append(el("div", { class: "section", text: `نسخة ${VERSION} — عميل شخصي. المكالمات والمحادثات السرّية غير مدعومة في نسخة الويب.` }));
+  body.append(el("div", { class: "section", text: `HBOLT ${VERSION} — المكالمات والمحادثات السرّية غير مدعومة.` }));
 }
 
 /** Features page: every optional feature, grouped, each with its own on/off. */

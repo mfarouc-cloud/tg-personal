@@ -3,6 +3,7 @@
 // long-press actions, "new" menu.
 import { Api } from "teleproto";
 import { customEmojiEl } from "../features/premiumMedia";
+import { unreadOnly, setUnreadOnly, isUnread, markAllRead } from "../features/powerTools";
 import { el, mount, fmtTime, toast } from "./dom";
 import { tg, peerKey } from "../telegram/client";
 import type { Dialog } from "../telegram/types";
@@ -96,7 +97,7 @@ export function renderChatList(nav: ChatListNav, mode: "main" | "archive" = "mai
     archive
       ? el("button", { class: "iconbtn", text: "‹", "aria-label": "رجوع", onclick: () => renderChatList(nav, "main") })
       : el("button", { class: "iconbtn", text: "⚙", "aria-label": "الإعدادات", onclick: nav.onOpenSettings }),
-    el("div", { class: "title" }, [archive ? "📦 الأرشيف" : "المحادثات", statusEl]),
+    el("div", { class: "title" }, [archive ? "📦 الأرشيف" : "HBOLT", statusEl]),
     archive ? el("span") : el("button", { class: "iconbtn", text: "✏️", "aria-label": "جديد", onclick: (e: MouseEvent) => openNewMenu(e) }),
   ]);
   const tabs = el("div", { class: "tabs", role: "tablist" });
@@ -156,6 +157,29 @@ export function renderChatList(nav: ChatListNav, mode: "main" | "archive" = "mai
           },
           [t.label, ...(unread ? [el("span", { class: "tab-count", text: String(unread) })] : [])],
         );
+      }),
+      el("button", {
+        class: "tab filter-chip" + (unreadOnly() ? " active" : ""),
+        text: "🔵 غير المقروء",
+        "aria-pressed": String(unreadOnly()),
+        onclick: () => {
+          setUnreadOnly(!unreadOnly());
+          paintTabs();
+          paint();
+        },
+      }),
+      el("button", {
+        class: "tab filter-chip",
+        text: "✓ تعليم كمقروء",
+        onclick: async () => {
+          if (isOn("ghostMode")) return toast("وضع الشبح شغال — اقفله الأول عشان تعلّم الرسايل مقروءة");
+          const pool = (currentTab.startsWith("f:") ? [...mainCache, ...archiveCache] : cache()).filter(currentMatch());
+          const n = await markAllRead(pool, (d) => tg.markRead(d.entity as any), (a, b) => toast(`قراءة ${a}/${b}`));
+          pool.forEach((d) => isUnread(d) && ((d as any).unreadCount = 0));
+          toast(`اتعلّمت ${n} محادثة مقروءة`);
+          paintTabs();
+          paint();
+        },
       }),
     );
   }
@@ -278,7 +302,7 @@ export function renderChatList(nav: ChatListNav, mode: "main" | "archive" = "mai
     }
     const match = currentMatch();
     const pool = currentTab.startsWith("f:") ? [...mainCache, ...archiveCache] : cache();
-    const items = pool.filter(match);
+    const items = pool.filter(match).filter((d) => !unreadOnly() || isUnread(d));
     for (const d of items) frag.append(row(d));
     if (!items.length) frag.append(el("div", { class: "center hint", text: archive ? "الأرشيف فاضي" : "مفيش محادثات هنا" }));
     list.append(frag);

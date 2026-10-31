@@ -2,7 +2,7 @@ import type { CapacitorConfig } from "@capacitor/cli";
 
 const config: CapacitorConfig = {
   appId: "com.farouk.tgpersonal",
-  appName: "تيليجرام",
+  appName: "HBOLT",
   webDir: "dist",
   ios: {
     contentInset: "never",

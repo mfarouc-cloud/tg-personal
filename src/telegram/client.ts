@@ -1192,6 +1192,11 @@ class TG {
    * forwarding). Media is re-uploaded with its original attributes so voice
    * notes stay voice notes, round videos stay round, stickers stay stickers.
    */
+  /** Forward several messages from the same chat in one call (keeps albums together). */
+  async forwardMany(target: Api.TypeEntityLike, msgs: Api.Message[], fromPeer: Api.TypeEntityLike, dropAuthor: boolean): Promise<void> {
+    await this.raw.forwardMessages(target, { messages: msgs.map((m) => m.id), fromPeer, dropAuthor });
+  }
+
   async resend(
     target: Api.TypeEntityLike,
     msg: Api.Message,

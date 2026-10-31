@@ -12,6 +12,7 @@ import type { Dialog } from "../telegram/types";
 import { getDialogsCached } from "./chatlist";
 import { describeMedia, isProtected, loadMedia } from "../features/media";
 import { isOn } from "../features/registry";
+import { runThrottled, chunk } from "../features/bulkForward";
 
 const K_HIDE = "tg.fwd.hideSender";
 
@@ -59,15 +60,21 @@ async function forwardTo(
 }
 
 /** Opens the "forward to…" sheet for `msg` coming from chat `src`. */
-export function openForwardPicker(msg: Api.Message, src: Dialog): void {
-  const protectedSrc = isProtected(msg, src.entity);
+export function openForwardPicker(msgIn: Api.Message | Api.Message[], src: Dialog, onDone?: () => void): void {
+  const msgs = (Array.isArray(msgIn) ? msgIn : [msgIn]).slice().sort((a, b) => a.id - b.id);
+  const msg = msgs[0];
+  const protectedSrc = msgs.some((m) => isProtected(m, src.entity));
+  let ctrl: AbortController | null = null;
   let hide = localStorage.getItem(K_HIDE) === "1";
   let busy = false;
   let filter = "";
   let dialogs: Dialog[] = [];
 
   const close = () => {
-    if (busy) return;
+    if (busy) {
+      ctrl?.abort();
+      return;
+    }
     overlay.remove();
   };
 
@@ -105,7 +112,7 @@ export function openForwardPicker(msg: Api.Message, src: Dialog): void {
 
   const sheet = el("div", { class: "sheet", role: "dialog", "aria-label": "توجيه إلى" }, [
     el("div", { class: "sheet-head" }, [
-      el("div", { class: "title", text: "توجيه إلى" }),
+      el("div", { class: "title", text: msgs.length > 1 ? `توجيه ${msgs.length} رسالة إلى` : "توجيه إلى" }),
       el("button", { class: "iconbtn", text: "✕", "aria-label": "إغلاق", onclick: close }),
     ]),
     el("div", { class: "searchbar" }, [search]),
@@ -121,9 +128,24 @@ export function openForwardPicker(msg: Api.Message, src: Dialog): void {
     busy = true;
     rowEl.classList.add("sending");
     try {
-      await forwardTo(msg, src, t, hide, (s) => (status.textContent = s));
+      if (msgs.length === 1) {
+        await forwardTo(msg, src, t, hide, (s) => (status.textContent = s));
+      } else {
+        // Bulk: batches of 10 ids per call, 2 s apart, FLOOD_WAIT-aware.
+        ctrl = new AbortController();
+        const srcPeer = (src.entity ?? src.inputEntity) as Api.TypeEntityLike;
+        const direct = protectedSrc ? [] : chunk(msgs, 10);
+        const single = protectedSrc ? msgs : [];
+        const report = (done: number, total: number, wait?: number) =>
+          (status.textContent = wait ? `⏳ تليجرام طالب انتظار ${wait} ث… (${done}/${total})` : `بيوجّه ${done}/${total} — دوس ✕ للإلغاء`);
+        const failedA = await runThrottled(direct, (batch) => tg.forwardMany(t.peer, batch, srcPeer, hide), { gapMs: 2000, onProgress: report, signal: ctrl.signal });
+        const failedB = await runThrottled(single, (m) => forwardTo(m, src, t, hide, () => {}), { gapMs: 2500, onProgress: report, signal: ctrl.signal });
+        const failed = failedA.reduce((n, f) => n + f.item.length, 0) + failedB.length;
+        if (failed) toast(`اتبعت ${msgs.length - failed} وفشل ${failed}`);
+      }
       busy = false;
       close();
+      onDone?.();
       toast(`اتبعت لـ ${t.title} ✓`);
     } catch (e: any) {
       busy = false;

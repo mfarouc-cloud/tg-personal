@@ -25,6 +25,8 @@ export function safeUrl(raw: string): string | null {
 
 /** Parse t.me / telegram.me links → { username, postId }. */
 export function parseTmeLink(url: string): { username: string; postId?: number } | null {
+  const c = url.match(/^(?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me)\/c\/(\d+)(?:\/(\d+))?/i);
+  if (c) return { username: "c/" + c[1], postId: c[2] ? Number(c[2]) : undefined };
   const m = url.match(/^(?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)\/([A-Za-z0-9_]{4,})(?:\/(\d+))?\/?(?:[?#].*)?$/i);
   if (!m || /^(joinchat|addstickers|share|proxy|socks|c|s)$/i.test(m[1])) return null;
   return { username: m[1], postId: m[2] ? Number(m[2]) : undefined };
