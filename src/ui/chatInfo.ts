@@ -10,7 +10,9 @@ import { displayName, dialogFor, isMuted } from "../telegram/entity";
 import { avatarEl } from "./avatar";
 import { premiumStar } from "./chatlist";
 import { askChoice, copyText } from "./chat/menu";
-import { describeMedia, loadMedia, saveBlob, fmtSize, fmtDuration } from "../features/media";
+import { describeMedia, loadMedia, saveBlob, fmtSize, fmtDuration, canSave, saveMany } from "../features/media";
+import { openGallery } from "../features/galleryViewer";
+import { openForwardPicker } from "./forward";
 import { renderText, safeUrl } from "./chat/format";
 
 export interface InfoNav {
@@ -150,42 +152,181 @@ export function renderChatInfo(dialog: Dialog, nav: InfoNav): void {
       ),
     );
 
+  // ---------- Gallery: paging, selection, fullscreen viewer ----------
+  let loaded: Api.Message[] = [];
+  let reachedEnd = false;
+  let loadingMore = false;
+  let selectingG = false;
+  const picked = new Map<number, Api.Message>();
+  let gridEl: HTMLElement | null = null;
+  const galleryBar = el("div", { class: "gallery-bar", style: { display: "none" } });
+  const selCount = el("span", { class: "count" });
+  galleryBar.append(
+    el("button", { class: "iconbtn", text: "✕", "aria-label": "إلغاء التحديد", onclick: () => setSelecting(false) }),
+    selCount,
+    el("button", { class: "btn small", text: "اختيار الكل", onclick: () => void selectAllRemote() }),
+    el("button", { class: "btn small", text: "⬇ تنزيل", onclick: () => void downloadPicked() }),
+    el("button", { class: "btn small primary", text: "↪ توجيه", onclick: () => forwardPicked() }),
+  );
+  const paintPicked = () => {
+    selCount.textContent = `${picked.size} محدد`;
+    panel.querySelectorAll<HTMLElement>("[data-mid]").forEach((n) => n.classList.toggle("picked", picked.has(Number(n.dataset.mid))));
+  };
+  function setSelecting(on: boolean) {
+    selectingG = on;
+    if (!on) picked.clear();
+    panel.classList.toggle("gallery-selecting", on);
+    galleryBar.style.display = on ? "" : "none";
+    paintPicked();
+  }
+  function togglePick(m: Api.Message) {
+    if (picked.has(m.id)) picked.delete(m.id);
+    else picked.set(m.id, m);
+    paintPicked();
+  }
+  async function selectAllRemote() {
+    const ctrl = new AbortController();
+    selCount.textContent = "بيجمع كل الوسائط…";
+    try {
+      const all = await tg.sharedMediaAll(entity, current as any, (n) => (selCount.textContent = `بيجمع… ${n}`), ctrl.signal);
+      for (const m of all) if (describeMedia(m) || current === "links") picked.set(m.id, m);
+      // Show everything that was fetched, so the selection is visible.
+      const known = new Set(loaded.map((m) => m.id));
+      const extra = all.filter((m) => !known.has(m.id));
+      if (extra.length) appendItems(extra);
+      reachedEnd = true;
+      toast(`اتحدد ${picked.size} عنصر`);
+    } catch (e: any) {
+      toast("تعذّر: " + (e?.errorMessage || e?.message || ""));
+    }
+    paintPicked();
+  }
+  async function downloadPicked() {
+    const list = [...picked.values()].filter((m) => describeMedia(m));
+    if (!list.length) return toast("حدد وسائط الأول");
+    const blocked = list.filter((m) => !canSave(m, entity));
+    if (blocked.length === list.length) return toast("الحفظ مقفول في المحادثة دي");
+    try {
+      const n = await saveMany(list.filter((m) => canSave(m, entity)), (d, t) => (selCount.textContent = `بيحمّل ${d}/${t}`));
+      toast(`اتحفظ ${n} ملف`);
+    } catch (e: any) {
+      toast("تعذّر: " + (e?.message || ""));
+    }
+    paintPicked();
+  }
+  function forwardPicked() {
+    const list = [...picked.values()];
+    if (!list.length) return toast("حدد عناصر الأول");
+    openForwardPicker(list, dialog, () => setSelecting(false));
+  }
+
   async function loadTab() {
+    loaded = [];
+    reachedEnd = false;
+    gridEl = null;
+    setSelecting(false);
     panel.replaceChildren(el("div", { class: "center small" }, [el("div", { class: "spinner" })]));
     try {
       if (current === "members") return void (await paintMembers());
-      const msgs = await tg.sharedMedia(entity, current);
+      const msgs = await tg.sharedMedia(entity, current, 0, 100);
       panel.replaceChildren();
       if (!msgs.length) return void panel.append(el("div", { class: "center hint", text: "مفيش حاجة هنا" }));
-      if (current === "media") return paintGrid(msgs);
-      for (const m of msgs) panel.append(listItem(m));
+      panel.append(
+        el("div", { class: "gallery-tools" }, [
+          el("button", { class: "btn small", text: "☑ تحديد", onclick: () => setSelecting(!selectingG) }),
+        ]),
+      );
+      if (msgs.length < 100) reachedEnd = true;
+      appendItems(msgs);
+      panel.append(galleryBar);
     } catch {
       panel.replaceChildren(el("div", { class: "center hint", text: "تعذّر التحميل" }));
     }
   }
 
-  function paintGrid(msgs: Api.Message[]) {
-    const grid = el("div", { class: "media-grid" });
-    for (const m of msgs) {
-      const info = describeMedia(m);
-      if (!info) continue;
-      const cell = el("button", { class: "mg-cell", onclick: () => nav.onOpenChat(dialog, m.id) }, [
-        el("span", { class: "mg-ph", text: info.kind === "photo" ? "📷" : "▶ " + fmtDuration(info.duration) }),
-      ]);
-      if (info.kind === "photo") {
-        const io = new IntersectionObserver((es) => {
-          if (!es[0].isIntersecting) return;
-          io.disconnect();
-          void loadMedia(m, info).then(({ url }) => {
-            cell.style.backgroundImage = `url("${url}")`;
-            cell.firstElementChild!.textContent = "";
-          }).catch(() => {});
-        });
-        io.observe(cell);
-      }
-      grid.append(cell);
+  async function loadMore() {
+    if (loadingMore || reachedEnd || !loaded.length || current === "members") return;
+    loadingMore = true;
+    try {
+      const more = await tg.sharedMedia(entity, current, loaded[loaded.length - 1].id, 100);
+      if (more.length < 100) reachedEnd = true;
+      appendItems(more.filter((m) => m instanceof Api.Message));
+    } catch {
+      /* retry on next scroll */
     }
-    panel.append(grid);
+    loadingMore = false;
+  }
+  body.addEventListener("scroll", () => {
+    if (body.scrollTop + body.clientHeight > body.scrollHeight - 600) void loadMore();
+  });
+
+  function appendItems(msgs: Api.Message[]) {
+    loaded.push(...msgs);
+    if (current === "media") {
+      if (!gridEl) {
+        gridEl = el("div", { class: "media-grid" });
+        panel.insertBefore(gridEl, galleryBar.parentNode === panel ? galleryBar : null);
+      }
+      for (const m of msgs) {
+        const c = gridCell(m);
+        if (c) gridEl.append(c);
+      }
+    } else {
+      for (const m of msgs) {
+        const r = listItem(m);
+        r.dataset.mid = String(m.id);
+        r.prepend(el("span", { class: "mg-check" }));
+        r.addEventListener("click", (e) => {
+          if (!selectingG) return;
+          e.preventDefault();
+          e.stopPropagation();
+          togglePick(m);
+        }, true);
+        panel.insertBefore(r, galleryBar.parentNode === panel ? galleryBar : null);
+      }
+    }
+    paintPicked();
+  }
+
+  function gridCell(m: Api.Message): HTMLElement | null {
+    const info = describeMedia(m);
+    if (!info) return null;
+    const cell = el("button", { class: "mg-cell", "data-mid": String(m.id) }, [
+      el("span", { class: "mg-check" }),
+      ...(info.kind !== "photo" ? [el("span", { class: "mg-dur", text: "▶ " + fmtDuration(info.duration) })] : []),
+    ]);
+    cell.onclick = () => {
+      if (selectingG) return togglePick(m);
+      const mediaOnly = loaded.filter((x) => describeMedia(x));
+      openGallery(mediaOnly, mediaOnly.indexOf(m), entity, {
+        onOpenInChat: (mm) => nav.onOpenChat(dialog, mm.id),
+        onForward: (mm) => openForwardPicker(mm, dialog),
+      });
+    };
+    // Thumbnail: Telegram's server-side preview (sharp, small) — full file only in the viewer.
+    const io = new IntersectionObserver((es) => {
+      if (!es[0].isIntersecting) return;
+      io.disconnect();
+      void (async () => {
+        for (const t of info.kind === "photo" ? [2, 1, 0] : [1, 0]) {
+          try {
+            const th = await tg.downloadMedia(m, { thumb: t });
+            if (th && th.length > 200) {
+              cell.style.backgroundImage = `url("${URL.createObjectURL(new Blob([th as unknown as BlobPart], { type: "image/jpeg" }))}")`;
+              return;
+            }
+          } catch {
+            /* next */
+          }
+        }
+        if (info.kind === "photo") {
+          const { url } = await loadMedia(m, info);
+          cell.style.backgroundImage = `url("${url}")`;
+        }
+      })().catch(() => {});
+    }, { rootMargin: "300px" });
+    io.observe(cell);
+    return cell;
   }
 
   function listItem(m: Api.Message): HTMLElement {

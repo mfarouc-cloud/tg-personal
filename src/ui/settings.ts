@@ -31,7 +31,7 @@ export interface SettingsNav {
   onBack: () => void;
 }
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 
 export function renderSettings(nav: SettingsNav): void {
   const back = () => renderSettings(nav);

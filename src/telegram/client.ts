@@ -558,7 +558,41 @@ class TG {
     return res.filter((m) => m instanceof Api.Message);
   }
 
-  async sharedMedia(entity: any, kind: "media" | "files" | "links" | "voice" | "music", offsetId = 0): Promise<Api.Message[]> {
+  /** Every message of a media kind in a chat (paged 100 at a time, FLOOD_WAIT-aware). */
+  async sharedMediaAll(
+    entity: any,
+    kind: "media" | "files" | "links" | "voice" | "music",
+    onProgress?: (n: number) => void,
+    signal?: AbortSignal,
+    max = 20000,
+  ): Promise<Api.Message[]> {
+    const all: Api.Message[] = [];
+    let offsetId = 0;
+    while (all.length < max) {
+      if (signal?.aborted) throw new Error("CANCELLED");
+      let page: Api.Message[];
+      try {
+        page = await this.sharedMedia(entity, kind, offsetId, 100);
+      } catch (e: any) {
+        const m = /FLOOD_WAIT_(\d+)/.exec(String(e?.errorMessage || e?.message || ""));
+        if (m) {
+          await new Promise((r) => setTimeout(r, (Number(m[1]) + 1) * 1000));
+          continue;
+        }
+        throw e;
+      }
+      const msgs = page.filter((x) => x instanceof Api.Message);
+      if (!msgs.length) break;
+      all.push(...msgs);
+      onProgress?.(all.length);
+      offsetId = msgs[msgs.length - 1].id;
+      if (page.length < 100) break;
+      await new Promise((r) => setTimeout(r, 350));
+    }
+    return all;
+  }
+
+  async sharedMedia(entity: any, kind: "media" | "files" | "links" | "voice" | "music", offsetId = 0, limit = 60): Promise<Api.Message[]> {
     const filter =
       kind === "media"
         ? new Api.InputMessagesFilterPhotoVideo()
@@ -569,7 +603,7 @@ class TG {
             : kind === "voice"
               ? new Api.InputMessagesFilterRoundVoice()
               : new Api.InputMessagesFilterMusic();
-    return (await this.raw.getMessages(entity, { filter, limit: 60, offsetId } as any)) as unknown as Api.Message[];
+    return (await this.raw.getMessages(entity, { filter, limit, offsetId } as any)) as unknown as Api.Message[];
   }
 
   /** Group/channel members (recent first). */

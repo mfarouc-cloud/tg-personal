@@ -17,6 +17,19 @@ import {
 import { isOn } from "../features/registry";
 import { tg } from "../telegram/client";
 import { enableZoom } from "../features/zoom";
+import { mediaDims } from "../features/media";
+
+/** Give the bubble frame the media's real aspect ratio (no stretching/cropping). */
+function sizeFrame(frame: HTMLElement, msg: Api.Message): void {
+  const d = mediaDims(msg);
+  if (!d) return;
+  const maxW = Math.min(320, window.innerWidth * 0.72);
+  const ratio = d.w / d.h;
+  const w = Math.min(maxW, d.w, ratio < 0.6 ? 220 : maxW);
+  frame.style.width = Math.round(w) + "px";
+  frame.style.aspectRatio = `${d.w} / ${d.h}`;
+  frame.style.maxHeight = "420px";
+}
 import { playTgs } from "../features/premiumMedia";
 
 const ICON: Record<MediaInfo["kind"], string> = {
@@ -108,9 +121,10 @@ export function renderMedia(
       const frame = el("button", { class: "media-frame", "aria-label": "صورة" }, [
         el("span", { class: "media-ph", text: ICON.photo + " " + meta }),
       ]);
+      sizeFrame(frame, msg);
       const show = async () => {
         const { url } = await load();
-        const img = el("img", { src: url, alt: "", loading: "lazy" });
+        const img = el("img", { src: url, alt: "", loading: "lazy", decoding: "async" });
         frame.replaceChildren(img);
         frame.onclick = () => openViewer(msg, info, url, chatEntity);
       };
@@ -131,6 +145,7 @@ export function renderMedia(
         el("span", { class: "play-badge", text: "▶" }),
         el("span", { class: "dur-badge", text: meta }),
       ]);
+      if (info.kind !== "videoNote") sizeFrame(frame, msg);
       // Inline preview: Telegram's server-side thumbnail (fast, tiny download).
       void (async () => {
         for (const t of [1, 0]) {

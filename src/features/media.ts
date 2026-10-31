@@ -228,3 +228,72 @@ export function fmtDuration(sec?: number): string {
   const s = Math.round(sec);
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
+
+/** Original pixel size of a photo/video (largest size Telegram has), for correct aspect ratio. */
+export function mediaDims(msg: Api.Message): { w: number; h: number } | null {
+  const media: any = (msg as any).media;
+  const photo = media?.photo;
+  if (photo?.sizes?.length) {
+    let best: any = null;
+    for (const s of photo.sizes) if (s.w && s.h && (!best || s.w * s.h > best.w * best.h)) best = s;
+    if (best) return { w: best.w, h: best.h };
+  }
+  const doc = media?.document;
+  const v = doc?.attributes?.find((a: any) => a instanceof Api.DocumentAttributeVideo || a instanceof Api.DocumentAttributeImageSize);
+  if (v?.w && v?.h) return { w: v.w, h: v.h };
+  return null;
+}
+
+/**
+ * Save many media files. iOS app: written to cache and handed to ONE share
+ * sheet (chunks of 20) so "Save N items" works; browser: sequential downloads.
+ */
+export async function saveMany(
+  msgs: Api.Message[],
+  onProgress?: (done: number, total: number) => void,
+  signal?: AbortSignal,
+): Promise<number> {
+  const items = msgs.map((m) => ({ m, info: describeMedia(m) })).filter((x): x is { m: Api.Message; info: MediaInfo } => !!x.info);
+  let done = 0;
+  if (Capacitor.isNativePlatform()) {
+    const { Filesystem, Directory } = await import("@capacitor/filesystem");
+    const { Share } = await import("@capacitor/share");
+    for (let i = 0; i < items.length; i += 20) {
+      const uris: string[] = [];
+      for (const { m, info } of items.slice(i, i + 20)) {
+        if (signal?.aborted) throw new Error("CANCELLED");
+        const { blob } = await loadMedia(m, info);
+        const b64: string = await new Promise((res, rej) => {
+          const r = new FileReader();
+          r.onload = () => res(String(r.result).split(",")[1] ?? "");
+          r.onerror = () => rej(r.error);
+          r.readAsDataURL(blob);
+        });
+        const { uri } = await Filesystem.writeFile({ path: `${m.id}_${info.name}`.replace(/[\\/:*?"<>|]/g, "_"), data: b64, directory: Directory.Cache });
+        uris.push(uri);
+        onProgress?.(++done, items.length);
+      }
+      try {
+        await Share.share({ files: uris });
+      } catch (e: any) {
+        if (!/cancel/i.test(String(e?.message ?? e))) throw e;
+      }
+    }
+    return done;
+  }
+  for (const { m, info } of items) {
+    if (signal?.aborted) throw new Error("CANCELLED");
+    const { blob } = await loadMedia(m, info);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = info.name;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    onProgress?.(++done, items.length);
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return done;
+}

@@ -1,7 +1,18 @@
-# CHECKPOINT — HBOLT (v1.0.0, formerly tg-personal)
+# CHECKPOINT — HBOLT (v1.1.0, formerly tg-personal)
 
 Personal Telegram client: TypeScript + Vite + teleproto (MTProto over WebSocket),
 wrapped as an iOS app with Capacitor 8 (SPM). Repo: `mfarouc-cloud/tg-personal`.
+
+## Done in v1.1.0
+| Area | Change | Files |
+|---|---|---|
+| Render fixes | Photos/videos sized from their real pixel dimensions (aspect-ratio, `object-fit: contain`, no min-width/crop); avatars always circular with clipped blur | `src/features/media.ts` (`mediaDims`), `src/ui/mediaView.ts` (`sizeFrame`), `src/style.css` |
+| Nicegram-style look | Translucent blurred bars/tabs/composer, rounded sheets & pill tabs | `src/style.css` |
+| Gallery viewer | Tap in Media tab → fullscreen swipe viewer (swipe/arrows, zoom, save, forward, open in chat), neighbours preloaded; no jump to chat | `src/features/galleryViewer.ts`, `src/ui/chatInfo.ts` |
+| Gallery selection | "☑ تحديد" in Media/Files/Links/Voice tabs; bottom bar: اختيار الكل / ⬇ تنزيل / ↪ توجيه | `src/ui/chatInfo.ts` |
+| Select all (no limit) | `tg.sharedMediaAll` pages 100 at a time until the end (FLOOD_WAIT-aware, cap 20 000) and selects every media id | `src/telegram/client.ts` |
+| Infinite scroll | Gallery loads 100 more on scroll (was a fixed 60) | `src/ui/chatInfo.ts` |
+| Bulk save | iOS: one share sheet per 20 files ("Save N items"); browser: sequential downloads | `src/features/media.ts` (`saveMany`) |
 
 ## Done in v1.0.0 (HBOLT)
 | Area | Change | Files |

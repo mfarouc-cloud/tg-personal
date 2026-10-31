@@ -340,6 +340,23 @@ else if (screen === "upload") {
   (window as any).stalled = () => tg.uploadStalled;
   void p;
 }
+else if (screen === "gallery") {
+  const { renderChatInfo } = await import("../src/ui/chatInfo");
+  const now = Math.floor(Date.now() / 1000);
+  const cv = document.createElement("canvas"); cv.width = 64; cv.height = 40;
+  const cx = cv.getContext("2d")!; cx.fillStyle = "#3a7"; cx.fillRect(0, 0, 64, 40);
+  const png = new Uint8Array(await (await new Promise<Blob>((r) => cv.toBlob((b) => r(b!), "image/png"))).arrayBuffer());
+  const mk = (id: number) => new Api.Message({ id, date: now - id, message: "", peerId: new Api.PeerChannel({ channelId: bigInt(5) }),
+    media: new Api.MessageMediaPhoto({ photo: new Api.Photo({ id: bigInt(id), accessHash: bigInt(1), fileReference: (globalThis as any).Buffer.alloc(0), date: now, sizes: [new Api.PhotoSize({ type: "x", w: 1280, h: 800, size: 1000 })], dcId: 2 }) }) } as any);
+  const ALL = Array.from({ length: 250 }, (_, i) => mk(1000 - i));
+  (window as any).calls = [];
+  (tg as any).sharedMedia = async (_e: any, _k: string, offsetId = 0, limit = 60) => { (window as any).calls.push(["page", offsetId, limit]); const start = offsetId ? ALL.findIndex((m) => m.id === offsetId) + 1 : 0; return ALL.slice(start, start + limit); };
+  (tg as any).downloadMedia = async () => png;
+  (tg as any).getFull = async () => ({ members: 900 });
+  (tg as any).getDialogs = async () => [];
+  const ch = new Api.Channel({ id: bigInt(5), title: "قناة الصور", broadcast: true, photo: new Api.ChatPhotoEmpty(), date: now } as any);
+  renderChatInfo({ entity: ch, title: "قناة الصور", isChannel: true, dialog: {} } as any, { onBack: () => {}, onOpenChat: () => {} } as any);
+}
 else if (screen === "chat") {
   (tg as any).getHistory = async () => [
     { id: 2, out: true, date: Math.floor(Date.now() / 1000), message: "تمام، اتفقنا" },
