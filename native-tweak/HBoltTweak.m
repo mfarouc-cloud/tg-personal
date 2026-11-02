@@ -80,6 +80,38 @@ static const uint32_t kUpdateStatus = 0x6628562c, kSetTyping = 0x58943ee2, kRead
     kChReadHistory = 0xcc104937, kReadContents = 0x36a73f77, kChReadContents = 0xeab5dc38,
     kReadStories = 0xa556dac8, kIncStoryViews = 0xb2028afb, kBoolTrue = 0x997275b5, kVector = 0x1cb5c415;
 
+static const uint32_t kAuthSendCode = 0xa677244f, kCodeSettings = 0xad253d78;
+// Skip a TL-serialized string/bytes at `off`; returns the offset after it or 0 on error.
+static NSUInteger TLSkipString(const uint8_t *b, NSUInteger len, NSUInteger off) {
+    if (off >= len) return 0;
+    NSUInteger n, head;
+    if (b[off] < 254) { n = b[off]; head = 1; }
+    else { if (off + 4 > len) return 0; n = b[off + 1] | (b[off + 2] << 8) | (b[off + 3] << 16); head = 4; }
+    NSUInteger total = head + n;
+    total = (total + 3) & ~(NSUInteger)3;
+    return off + total <= len ? off + total : 0;
+}
+// auth.sendCode from a re-signed official binary asks Telegram to verify the
+// app via a silent push to *Telegram's own* bundle id, which can never reach
+// this app -> the request times out ("check your internet connection").
+// Re-declare the client capabilities with plain CodeSettings (no push/firebase
+// verification) so Telegram sends the code in-app / by SMS like any other client.
+static NSData *HBFixSendCode(NSData *payload) {
+    const uint8_t *b = payload.bytes; NSUInteger len = payload.length;
+    NSUInteger off = TLSkipString(b, len, 4);          // phone_number
+    if (!off || off + 4 > len) return nil;
+    off += 4;                                           // api_id
+    off = TLSkipString(b, len, off);                    // api_hash
+    if (!off || off + 4 > len) return nil;
+    uint32_t ctor; memcpy(&ctor, b + off, 4);
+    if (ctor != kCodeSettings) return nil;
+    NSMutableData *m = [NSMutableData dataWithBytes:b length:off];
+    uint32_t tail[2] = {kCodeSettings, 0};
+    [m appendBytes:tail length:8];
+    HBLog(@"auth.sendCode: plain CodeSettings");
+    return m;
+}
+
 static NSData *TLOfflineStatus(void) {
     uint32_t w[2] = {kUpdateStatus, kBoolTrue};
     return [NSData dataWithBytes:w length:8];
@@ -90,9 +122,11 @@ static NSData *TLEmptyReadContents(void) {
 }
 
 static NSData *HBRewrite(NSData *payload) {
-    if (payload.length < 4 || !HBOn(@"ghost", YES)) return nil;
+    if (payload.length < 4) return nil;
     uint32_t ctor = 0;
     [payload getBytes:&ctor length:4];
+    if (ctor == kAuthSendCode) return HBOn(@"fix.login", YES) ? HBFixSendCode(payload) : nil;
+    if (!HBOn(@"ghost", YES)) return nil;
     switch (ctor) {
         case kUpdateStatus:
             return HBOn(@"ghost.online", YES) ? TLOfflineStatus() : nil;
