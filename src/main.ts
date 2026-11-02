@@ -211,7 +211,18 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     hiddenAt = Date.now();
   } else if (locked() && hiddenAt && Date.now() - hiddenAt > 60_000) {
-    renderLock(() => (booted ? openList() : boot()));
+    // Re-lock without losing the current screen: restore it after unlock
+    // (previously this always jumped back to the chat list).
+    const app = document.getElementById("app")!;
+    const prev = [...app.childNodes];
+    const overlays = [...document.querySelectorAll<HTMLElement>(".gviewer")];
+    overlays.forEach((o) => (o.style.display = "none"));
+    renderLock(() => {
+      if (!booted) return boot();
+      if (prev.length) app.replaceChildren(...prev);
+      else openList();
+      overlays.forEach((o) => (o.style.display = ""));
+    });
   }
 });
 

@@ -1,7 +1,15 @@
-# CHECKPOINT — HBOLT (v1.1.0, formerly tg-personal)
+# CHECKPOINT — HBOLT (v1.2.0, formerly tg-personal)
 
 Personal Telegram client: TypeScript + Vite + teleproto (MTProto over WebSocket),
 wrapped as an iOS app with Capacitor 8 (SPM). Repo: `mfarouc-cloud/tg-personal`.
+
+## Done in v1.2.0
+| Area | Change | Files |
+|---|---|---|
+| Crisp avatars | Load full-size 640px profile photos (was 160px small → pixelated); avatar cache bumped to v2 | `src/ui/avatar.ts`, `src/style.css` |
+| Media tab → viewer | Grid tap can't bubble/navigate; viewer swallows touches, sits above everything, system back closes the viewer only | `src/ui/chatInfo.ts`, `src/features/galleryViewer.ts` |
+| Re-lock kept screen | Passcode re-lock after background restores the same screen (+ open viewer) instead of jumping to the chat list | `src/main.ts` |
+| Select all | No 20 000 cap — pages (100/request, Telegram's max) until the end | `src/telegram/client.ts` |
 
 ## Done in v1.1.0
 | Area | Change | Files |

@@ -9,7 +9,7 @@ import { displayName, realName } from "../telegram/entity";
 
 const mem = new Map<string, string>(); // photoId → object URL
 const inflight = new Map<string, Promise<string | null>>();
-const CACHE = "tg-avatars-v1";
+const CACHE = "tg-avatars-v2"; // v2 = full-size (640px) photos
 
 function photoOf(entity: any): { id: string; stripped?: Uint8Array } | null {
   const p = entity?.photo;
@@ -48,7 +48,10 @@ export function loadAvatar(entity: any): Promise<string | null> {
   const p = (async () => {
     let url = await fromCacheStorage(ph.id);
     if (!url) {
-      const bytes = await tg.profilePhoto(entity).catch(() => undefined);
+      // Full-size photo (640px) so avatars stay crisp on Retina screens; fall back to small.
+      const bytes =
+        (await tg.profilePhoto(entity, true).catch(() => undefined)) ??
+        (await tg.profilePhoto(entity, false).catch(() => undefined));
       if (!bytes) return null;
       const blob = new Blob([bytes as unknown as BlobPart], { type: "image/jpeg" });
       void toCacheStorage(ph.id, blob);

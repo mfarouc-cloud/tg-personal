@@ -18,10 +18,19 @@ export function openGallery(
   let idx = Math.max(0, list.indexOf(msgs[start]));
   const stage = el("div", { class: "gstage" });
   const counter = el("span", { class: "counter" });
+  let closed = false;
   const close = () => {
+    if (closed) return;
+    closed = true;
     stage.querySelectorAll("video").forEach((v) => (v as HTMLVideoElement).pause());
     overlay.remove();
     window.removeEventListener("keydown", onKey);
+    window.removeEventListener("popstate", onPop);
+    if (history.state?.hboltViewer) history.back();
+  };
+  // A system "back" closes the viewer instead of leaving the media tab.
+  const onPop = () => {
+    if (!history.state?.hboltViewer) close();
   };
   const cur = () => list[idx];
   const bar = el("div", { class: "viewer-bar" }, [
@@ -45,7 +54,11 @@ export function openGallery(
   const prev = el("button", { class: "gnav prev", text: "›", "aria-label": "السابق", onclick: () => go(-1) });
   const next = el("button", { class: "gnav next", text: "‹", "aria-label": "التالي", onclick: () => go(1) });
   const overlay = el("div", { class: "gviewer", role: "dialog" }, [bar, stage, prev, next]);
+  // Keep every touch inside the viewer so nothing underneath reacts to swipes.
+  for (const t of ["touchstart", "touchmove", "touchend", "click"]) overlay.addEventListener(t, (e) => e.stopPropagation());
   document.body.append(overlay);
+  history.pushState({ hboltViewer: true }, "");
+  window.addEventListener("popstate", onPop);
 
   let seq = 0;
   async function show() {
@@ -64,7 +77,8 @@ export function openGallery(
         enableZoom(img);
         stage.replaceChildren(img);
       } else {
-        const v = el("video", { src: url, controls: "", playsinline: "", autoplay: "" }) as HTMLVideoElement;
+        const v = el("video", { src: url, controls: "", playsinline: "", "webkit-playsinline": "", autoplay: "" }) as HTMLVideoElement;
+        v.playsInline = true;
         if (info.kind === "gif") (v.muted = true), (v.loop = true);
         stage.replaceChildren(v);
       }

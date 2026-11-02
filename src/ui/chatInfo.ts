@@ -295,7 +295,11 @@ export function renderChatInfo(dialog: Dialog, nav: InfoNav): void {
       el("span", { class: "mg-check" }),
       ...(info.kind !== "photo" ? [el("span", { class: "mg-dur", text: "▶ " + fmtDuration(info.duration) })] : []),
     ]);
-    cell.onclick = () => {
+    cell.type = "button";
+    cell.onclick = (ev) => {
+      // Never let the tap bubble to the screen (which could navigate away).
+      ev.preventDefault();
+      ev.stopPropagation();
       if (selectingG) return togglePick(m);
       const mediaOnly = loaded.filter((x) => describeMedia(x));
       openGallery(mediaOnly, mediaOnly.indexOf(m), entity, {

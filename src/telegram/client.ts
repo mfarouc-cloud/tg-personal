@@ -564,7 +564,7 @@ class TG {
     kind: "media" | "files" | "links" | "voice" | "music",
     onProgress?: (n: number) => void,
     signal?: AbortSignal,
-    max = 20000,
+    max = Number.POSITIVE_INFINITY, // no cap: page until Telegram says there is no more
   ): Promise<Api.Message[]> {
     const all: Api.Message[] = [];
     let offsetId = 0;
