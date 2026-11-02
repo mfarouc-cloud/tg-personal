@@ -1,0 +1,23 @@
+name: Build HBolt native tweak (dylib)
+on:
+  push:
+    paths: ["native-tweak/**", ".github/workflows/native-tweak.yml"]
+  workflow_dispatch:
+jobs:
+  dylib:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile arm64 dylib
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 \
+            -dynamiclib -fobjc-arc -O2 -Wall -Werror=objc-method-access \
+            -framework Foundation -framework UIKit \
+            -install_name @executable_path/Frameworks/HBoltTweak.dylib \
+            native-tweak/HBoltTweak.m -o HBoltTweak.dylib
+          codesign -f -s - HBoltTweak.dylib
+          file HBoltTweak.dylib; otool -L HBoltTweak.dylib
+      - uses: actions/upload-artifact@v4
+        with: { name: HBoltTweak, path: HBoltTweak.dylib }
