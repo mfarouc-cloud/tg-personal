@@ -85,6 +85,14 @@ jobs:
           }
           JSON
 
+      - name: Bazel cache
+        uses: actions/cache@v4
+        with:
+          path: ~/telegram-bazel-cache
+          key: tgbazel-${{ hashFiles('native/upstream.txt') }}-${{ hashFiles('native/patches/**') }}
+          restore-keys: |
+            tgbazel-${{ hashFiles('native/upstream.txt') }}-
+
       - name: Build (Bazel, release_arm64, fake codesigning — re-sign on device)
         working-directory: tgios
         shell: bash
