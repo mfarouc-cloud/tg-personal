@@ -199,6 +199,41 @@ static void HBMaybeShowDiag(void) {
     [vc presentViewController:a animated:YES completion:nil];
 }
 
+#pragma mark - CloudKit: the re-signed app has no iCloud entitlement, and
+// CloudKit throws an NSException ("no CloudKit entitlement") the moment
+// Telegram asks for a container -> instant crash. Hand back an inert proxy
+// instead: every message to it is swallowed and returns 0/nil, so Telegram's
+// optional iCloud features simply never complete.
+@interface HBInertCK : NSProxy
+@end
+@implementation HBInertCK
++ (instancetype)shared { static HBInertCK *s; static dispatch_once_t o; dispatch_once(&o, ^{ s = [HBInertCK alloc]; }); return s; }
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel {
+    Class ck = objc_getClass("CKContainer");
+    NSMethodSignature *sig = ck ? [ck instanceMethodSignatureForSelector:sel] : nil;
+    if (!sig) { Class db = objc_getClass("CKDatabase"); sig = db ? [db instanceMethodSignatureForSelector:sel] : nil; }
+    return sig ?: [NSObject instanceMethodSignatureForSelector:@selector(description)];
+}
+- (void)forwardInvocation:(NSInvocation *)inv {
+    NSUInteger len = inv.methodSignature.methodReturnLength;
+    if (len) { void *zero = calloc(1, len); [inv setReturnValue:zero]; free(zero); }
+}
+- (BOOL)respondsToSelector:(SEL)s { return YES; }
+- (NSString *)description { return @"<HBInertCKContainer>"; }
+@end
+static id HB_ckDefault(id cls, SEL _cmd) { HBLog(@"CloudKit defaultContainer -> inert"); return [HBInertCK shared]; }
+static id HB_ckWithId(id cls, SEL _cmd, NSString *ident) { HBLog(@"CloudKit container %@ -> inert", ident); return [HBInertCK shared]; }
+static void HBNeuterCloudKit(void) {
+    Class ck = objc_getClass("CKContainer");
+    if (!ck) return;
+    Method m1 = class_getClassMethod(ck, @selector(defaultContainer));
+    Method m2 = class_getClassMethod(ck, NSSelectorFromString(@"containerWithIdentifier:"));
+    if (m1) method_setImplementation(m1, (IMP)HB_ckDefault);
+    if (m2) method_setImplementation(m2, (IMP)HB_ckWithId);
+    Method i1 = class_getInstanceMethod(ck, NSSelectorFromString(@"initWithContainerIdentifier:"));
+    if (i1) method_setImplementation(i1, (IMP)HB_ckWithId);
+}
+
 static void HBSwizzle(Class c, SEL orig, SEL repl) {
     Method o = class_getInstanceMethod(c, orig), r = class_getInstanceMethod(c, repl);
     if (!o || !r) return;
@@ -224,6 +259,7 @@ __attribute__((constructor)) static void HBoltInit(void) {
     Method c = class_getInstanceMethod([NSFileManager class], @selector(containerURLForSecurityApplicationGroupIdentifier:));
     if (c) gOrigContainer = method_setImplementation(c, (IMP)HB_container);
     HBSwizzle([UIWindow class], @selector(motionEnded:withEvent:), @selector(hb_motionEnded:withEvent:));
+    HBNeuterCloudKit();
     HBInstallNetworkHook();
     HBLog(@"bundle %@ v%@", NSBundle.mainBundle.bundleIdentifier, [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"]);
     NSSetUncaughtExceptionHandler(&HBUncaught);
