@@ -177,6 +177,7 @@ static NSURL *HB_container(id self, SEL _cmd, NSString *groupId) {
 // responder chain (UIWindowScene included), so the swizzled selector must exist
 // on every responder or UIKit raises "unrecognized selector".
 static BOOL gMenuOpen = NO;
+static UIWindow *HBKeyWindow(void);
 @interface UIResponder (HBolt)
 @end
 @implementation UIResponder (HBolt)
