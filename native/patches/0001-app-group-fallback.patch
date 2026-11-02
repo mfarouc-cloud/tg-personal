@@ -1,0 +1,20 @@
+diff --git a/submodules/TelegramUI/Sources/AppDelegate.swift b/submodules/TelegramUI/Sources/AppDelegate.swift
+index 1ceb46bc..51f25eef 100644
+--- a/submodules/TelegramUI/Sources/AppDelegate.swift
++++ b/submodules/TelegramUI/Sources/AppDelegate.swift
+@@ -573,7 +573,14 @@ private func extractAccountManagerState(records: AccountRecordsView<TelegramAcco
+         try! PasscodeEnvironment.shared.configure(PasscodeConfiguration(appGroupIdentifier: appGroupName, processRole: .mainApp, biometricKeychainService: walletBiometricKeychainService), privateAccessGroup: {
+             BuildConfig.keychainAccessGroup(baseAppBundleId: baseAppBundleId)
+         })
+-        let maybeAppGroupUrl = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupName)
++        // HBOLT: sideloaded/re-signed builds often lack the App Group entitlement.
++        // Fall back to the app's own Application Support folder instead of stopping at "Error 2" (white screen).
++        let maybeAppGroupUrl: URL? = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupName) ?? {
++            guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
++            let url = base.appendingPathComponent("HBOLTGroup", isDirectory: true)
++            try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
++            return url
++        }()
+         
+         let buildConfig = BuildConfig(baseAppBundleId: baseAppBundleId)
+         self.buildConfig = buildConfig
