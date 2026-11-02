@@ -1,0 +1,15 @@
+diff --git a/submodules/Display/Source/WindowContent.swift b/submodules/Display/Source/WindowContent.swift
+index edbdcd587..992e67811 100644
+--- a/submodules/Display/Source/WindowContent.swift
++++ b/submodules/Display/Source/WindowContent.swift
+@@ -281,9 +281,7 @@ public final class WindowHostView {
+     /// Multi-display devices only: the fold while the system reports it active, in `eventView`
+     /// coordinates. Nil before iOS 27.1.
+     fileprivate var activeDivision: CGRect? {
+-        if #available(iOS 27.1, *) {
+-            return self.eventView.reservedRegions(kind: .division).first(where: \.isActive)?.frame
+-        }
++        // HBOLT: built with the iOS 26 SDK (GitHub runners) — the iOS 27.1 fold API isn't available.
+         return nil
+     }
+     
