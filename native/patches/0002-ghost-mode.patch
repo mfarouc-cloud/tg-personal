@@ -1,0 +1,128 @@
+diff --git a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift
+index 8c474034..22fae462 100644
+--- a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
++++ b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
+@@ -135,6 +135,7 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+     case dataSettings(PresentationTheme, String)
+     case dataSettingsInfo(PresentationTheme, String)
+     case openLinksIn(PresentationTheme, String, String)
++    case hboltGhostMode(String, Bool)
+     
+     var section: ItemListSectionId {
+         switch self {
+@@ -150,7 +151,7 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+             return PrivacyAndSecuritySection.account.rawValue
+         case .dataSettings, .dataSettingsInfo:
+             return PrivacyAndSecuritySection.dataSettings.rawValue
+-        case .openLinksIn:
++        case .openLinksIn, .hboltGhostMode:
+             return PrivacyAndSecuritySection.linkHandling.rawValue
+         }
+     }
+@@ -223,11 +224,19 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+                 return 32
+             case .openLinksIn:
+                 return 33
++            case .hboltGhostMode:
++                return 100
+         }
+     }
+     
+     static func ==(lhs: PrivacyAndSecurityEntry, rhs: PrivacyAndSecurityEntry) -> Bool {
+         switch lhs {
++            case let .hboltGhostMode(lhsText, lhsValue):
++                if case let .hboltGhostMode(rhsText, rhsValue) = rhs, lhsText == rhsText, lhsValue == rhsValue {
++                    return true
++                } else {
++                    return false
++                }
+             case let .privacyHeader(lhsTheme, lhsText):
+                 if case let .privacyHeader(rhsTheme, rhsText) = rhs, lhsTheme === rhsTheme, lhsText == rhsText {
+                     return true
+@@ -436,6 +445,11 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+     func item(presentationData: ItemListPresentationData, arguments: Any) -> ListViewItem {
+         let arguments = arguments as! PrivacyAndSecurityControllerArguments
+         switch self {
++            case let .hboltGhostMode(text, value):
++                let _ = arguments
++                return ItemListSwitchItem(presentationData: presentationData, systemStyle: .glass, title: text, value: value, sectionId: self.section, style: .blocks, updated: { value in
++                    HBOLTSettings.ghostMode = value
++                })
+             case let .privacyHeader(_, text):
+                 return ItemListSectionHeaderItem(presentationData: presentationData, text: text, sectionId: self.section)
+             case let .blockedPeers(_, text, value):
+@@ -823,6 +837,7 @@ private func privacyAndSecurityControllerEntries(
+     entries.append(.dataSettingsInfo(presentationData.theme, presentationData.strings.PrivacySettings_DataSettingsHelp))
+     
+     entries.append(.openLinksIn(presentationData.theme, presentationData.strings.ChatSettings_OpenLinksIn, defaultWebBrowser))
++    entries.append(.hboltGhostMode("👻 Ghost Mode (HBOLT)", HBOLTSettings.ghostMode))
+ 
+     return entries
+ }
+diff --git a/submodules/TelegramCore/Sources/HBOLTSettings.swift b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+new file mode 100644
+index 00000000..15e10fb0
+--- /dev/null
++++ b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+@@ -0,0 +1,12 @@
++import Foundation
++
++/// HBOLT on-device feature switches (stored only in this app's UserDefaults).
++public enum HBOLTSettings {
++    private static let defaults = UserDefaults.standard
++
++    /// Ghost Mode: never appear online, never send "typing…", never send read receipts.
++    public static var ghostMode: Bool {
++        get { return defaults.bool(forKey: "hbolt.ghostMode") }
++        set { defaults.set(newValue, forKey: "hbolt.ghostMode") }
++    }
++}
+diff --git a/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift b/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift
+index 7256668b..7087bfd0 100644
+--- a/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift
+@@ -53,7 +53,7 @@ private final class AccountPresenceManagerImpl {
+             }, queue: self.queue)
+             self.onlineTimer = timer
+             timer.start()
+-            request = self.network.request(Api.functions.account.updateStatus(offline: .boolFalse))
++            request = self.network.request(Api.functions.account.updateStatus(offline: HBOLTSettings.ghostMode ? .boolTrue : .boolFalse))
+         } else {
+             self.onlineTimer?.invalidate()
+             self.onlineTimer = nil
+diff --git a/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift b/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift
+index e8e08874..e0286315 100644
+--- a/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift
+@@ -175,6 +175,9 @@ private func requestActivity(postbox: Postbox, network: Network, accountPeerId:
+                 }
+             }
+             
++            if HBOLTSettings.ghostMode {
++                return .complete()
++            }
+             if let inputPeer = apiInputPeer(peer) {
+                 var flags: Int32 = 0
+                 let topMessageId = threadId.flatMap { Int32(clamping: $0) }
+diff --git a/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift b/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift
+index b2e65895..f4762c2d 100644
+--- a/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift
++++ b/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift
+@@ -290,7 +290,7 @@ private func pushPeerReadState(network: Network, postbox: Postbox, stateManager:
+                 let (channelId, accessHash) = (inputPeerChannelData.channelId, inputPeerChannelData.accessHash)
+                 switch readState {
+                 case let .idBased(maxIncomingReadId, _, _, _, markedUnread):
+-                    var pushSignal: Signal<Void, NoError> = network.request(Api.functions.channels.readHistory(channel: Api.InputChannel.inputChannel(.init(channelId: channelId, accessHash: accessHash)), maxId: maxIncomingReadId))
++                    var pushSignal: Signal<Void, NoError> = (HBOLTSettings.ghostMode ? .complete() : network.request(Api.functions.channels.readHistory(channel: Api.InputChannel.inputChannel(.init(channelId: channelId, accessHash: accessHash)), maxId: maxIncomingReadId)))
+                     |> `catch` { _ -> Signal<Api.Bool, NoError> in
+                         return .complete()
+                     }
+@@ -320,7 +320,7 @@ private func pushPeerReadState(network: Network, postbox: Postbox, stateManager:
+             default:
+                 switch readState {
+                 case let .idBased(maxIncomingReadId, _, _, _, markedUnread):
+-                    var pushSignal: Signal<Void, NoError> = network.request(Api.functions.messages.readHistory(peer: inputPeer, maxId: maxIncomingReadId))
++                    var pushSignal: Signal<Void, NoError> = (HBOLTSettings.ghostMode ? .complete() : network.request(Api.functions.messages.readHistory(peer: inputPeer, maxId: maxIncomingReadId)))
+                     |> map(Optional.init)
+                     |> `catch` { _ -> Signal<Api.messages.AffectedMessages?, NoError> in
+                         return .single(nil)

@@ -1,2 +1,2 @@
-# Telegram-iOS commit HBOLT native is built on (official open-source client, GPLv2)
-279f89e4
+# Telegram-iOS commit HBOLT native is built on (13.0.1 — last one built with Xcode 26.6, which GitHub runners have)
+14a2ebfc4632055855d49926e31f2b0c6d6e8edc
