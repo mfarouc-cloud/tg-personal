@@ -43,6 +43,21 @@ jobs:
       - name: Fresh codesigning profiles (upstream fake ones expired 2026-10-30)
         run: python3 native/make-profiles.py tgios/build-system/fake-codesigning com.farouk.hbolt
 
+      - name: Import build-time signing identity (Telegram fake-codesigning cert)
+        run: |
+          FC=tgios/build-system/fake-codesigning
+          KC="$RUNNER_TEMP/hbolt.keychain-db"
+          security create-keychain -p ci "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p ci "$KC"
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$KC"
+          security import "$FC/certs/SelfSigned.p12" -k "$KC" -P "" -A -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci "$KC" >/dev/null
+          sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$FC/certs/Public.cer" || true
+          security find-identity -p codesigning "$KC"
+          security find-identity -v -p codesigning "$KC"
+
       - name: Configuration
         env:
           API_ID: ${{ secrets.TG_API_ID }}
