@@ -14,7 +14,7 @@ jobs:
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 \
             -dynamiclib -fobjc-arc -O2 -Wall -Werror=objc-method-access \
-            -framework Foundation -framework UIKit -framework CoreGraphics \
+            -framework Foundation -framework UIKit -framework CoreGraphics -framework Security \
             -install_name @executable_path/Frameworks/HBoltTweak.dylib \
             native-tweak/HBoltTweak.m -o HBoltTweak.dylib
           codesign -f -s - HBoltTweak.dylib

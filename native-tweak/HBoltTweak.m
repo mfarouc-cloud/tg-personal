@@ -15,6 +15,56 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <Security/Security.h>
+
+#pragma mark - Diagnostics (shown on screen if launch stalls)
+static NSMutableArray<NSString *> *gDiag;
+static void HBLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+static void HBLog(NSString *fmt, ...) {
+    va_list a; va_start(a, fmt);
+    NSString *line = [[NSString alloc] initWithFormat:fmt arguments:a];
+    va_end(a);
+    NSLog(@"[HBolt] %@", line);
+    @synchronized([NSProcessInfo class]) {
+        if (!gDiag) gDiag = [NSMutableArray array];
+        if (gDiag.count < 60) [gDiag addObject:line];
+    }
+}
+
+#pragma mark - Keychain: drop access groups the re-signed app isn't entitled to
+static CFDictionaryRef HBStripGroup(CFDictionaryRef q) {
+    if (!q || !CFDictionaryContainsKey(q, kSecAttrAccessGroup)) return q ? CFRetain(q) : NULL;
+    CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(NULL, 0, q);
+    CFDictionaryRemoveValue(m, kSecAttrAccessGroup);
+    return m;
+}
+static OSStatus hb_SecItemCopyMatching(CFDictionaryRef q, CFTypeRef *r) {
+    CFDictionaryRef s = HBStripGroup(q); OSStatus st = SecItemCopyMatching(s, r); if (s) CFRelease(s);
+    if (st != errSecSuccess && st != errSecItemNotFound) HBLog(@"keychain copy err %d", (int)st);
+    return st;
+}
+static OSStatus hb_SecItemAdd(CFDictionaryRef q, CFTypeRef *r) {
+    CFDictionaryRef s = HBStripGroup(q); OSStatus st = SecItemAdd(s, r); if (s) CFRelease(s);
+    if (st != errSecSuccess) HBLog(@"keychain add err %d", (int)st);
+    return st;
+}
+static OSStatus hb_SecItemUpdate(CFDictionaryRef q, CFDictionaryRef u) {
+    CFDictionaryRef s = HBStripGroup(q); OSStatus st = SecItemUpdate(s, u); if (s) CFRelease(s);
+    if (st != errSecSuccess && st != errSecItemNotFound) HBLog(@"keychain update err %d", (int)st);
+    return st;
+}
+static OSStatus hb_SecItemDelete(CFDictionaryRef q) {
+    CFDictionaryRef s = HBStripGroup(q); OSStatus st = SecItemDelete(s); if (s) CFRelease(s);
+    return st;
+}
+// dyld interposing (applies to every image loaded at launch).
+typedef struct { const void *replacement; const void *original; } hb_interpose_t;
+__attribute__((used)) static const hb_interpose_t hb_interposers[] __attribute__((section("__DATA,__interpose"))) = {
+    { (const void *)hb_SecItemCopyMatching, (const void *)SecItemCopyMatching },
+    { (const void *)hb_SecItemAdd, (const void *)SecItemAdd },
+    { (const void *)hb_SecItemUpdate, (const void *)SecItemUpdate },
+    { (const void *)hb_SecItemDelete, (const void *)SecItemDelete },
+};
 
 static NSString *const kPrefix = @"hbolt.";
 static BOOL HBOn(NSString *k, BOOL def) {
@@ -80,7 +130,8 @@ static void HB_setPayload(id self, SEL _cmd, NSData *payload, id metadata, id sh
 static IMP gOrigContainer;
 static NSURL *HB_container(id self, SEL _cmd, NSString *groupId) {
     NSURL *url = ((NSURL * (*)(id, SEL, NSString *))gOrigContainer)(self, _cmd, groupId);
-    if (url) return url;
+    if (url) { HBLog(@"group ok %@", groupId); return url; }
+    HBLog(@"group FALLBACK %@", groupId);
     NSURL *lib = [[NSFileManager defaultManager] URLsForDirectory:NSLibraryDirectory inDomains:NSUserDomainMask].firstObject;
     NSURL *fallback = [[lib URLByAppendingPathComponent:@"HBoltAppGroup" isDirectory:YES] URLByAppendingPathComponent:groupId ?: @"default" isDirectory:YES];
     [[NSFileManager defaultManager] createDirectoryAtURL:fallback withIntermediateDirectories:YES attributes:nil error:nil];
@@ -116,6 +167,38 @@ static NSURL *HB_container(id self, SEL _cmd, NSString *groupId) {
 }
 @end
 
+static void HBUncaught(NSException *e) {
+    HBLog(@"EXCEPTION %@: %@", e.name, e.reason);
+    [[gDiag componentsJoinedByString:@"\n"] writeToFile:[NSTemporaryDirectory() stringByAppendingPathComponent:@"hbolt-crash.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static UIWindow *HBKeyWindow(void) {
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes)
+        if ([sc isKindOfClass:[UIWindowScene class]])
+            for (UIWindow *w in ((UIWindowScene *)sc).windows) if (w.isKeyWindow) return w;
+    return UIApplication.sharedApplication.windows.firstObject;
+}
+
+static void HBMaybeShowDiag(void) {
+    UIWindow *w = HBKeyWindow();
+    UIViewController *root = w.rootViewController;
+    BOOL blank = !w || !root || root.view.subviews.count == 0 || w.hidden;
+    NSString *prev = [NSString stringWithContentsOfFile:[NSTemporaryDirectory() stringByAppendingPathComponent:@"hbolt-crash.txt"] encoding:NSUTF8StringEncoding error:nil];
+    HBLog(@"window=%@ root=%@ subviews=%lu", w ? @"yes" : @"no", NSStringFromClass(root.class), (unsigned long)root.view.subviews.count);
+    if (!blank && !prev) return;
+    NSString *report = [NSString stringWithFormat:@"%@%@", prev ? [@"آخر كراش:\n" stringByAppendingString:prev] : @"", [gDiag componentsJoinedByString:@"\n"]];
+    UIPasteboard.generalPasteboard.string = report;
+    UIWindow *dw = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)UIApplication.sharedApplication.connectedScenes.anyObject];
+    dw.windowLevel = UIWindowLevelAlert + 1;
+    UIViewController *vc = [UIViewController new];
+    dw.rootViewController = vc;
+    [dw makeKeyAndVisible];
+    objc_setAssociatedObject(UIApplication.sharedApplication, "hbdiag", dw, OBJC_ASSOCIATION_RETAIN);
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"HBolt — تقرير التشغيل" message:[report stringByAppendingString:@"\n\n(اتنسخ — ابعته)"] preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"تمام" style:UIAlertActionStyleCancel handler:nil]];
+    [vc presentViewController:a animated:YES completion:nil];
+}
+
 static void HBSwizzle(Class c, SEL orig, SEL repl) {
     Method o = class_getInstanceMethod(c, orig), r = class_getInstanceMethod(c, repl);
     if (!o || !r) return;
@@ -134,7 +217,7 @@ static void HBInstallNetworkHook(void) {
     if (!m) return;
     gOrigSetPayload = method_setImplementation(m, (IMP)HB_setPayload);
     done = YES;
-    NSLog(@"[HBolt] MTRequest hook installed");
+    HBLog(@"MTRequest hook installed");
 }
 
 __attribute__((constructor)) static void HBoltInit(void) {
@@ -142,6 +225,13 @@ __attribute__((constructor)) static void HBoltInit(void) {
     if (c) gOrigContainer = method_setImplementation(c, (IMP)HB_container);
     HBSwizzle([UIWindow class], @selector(motionEnded:withEvent:), @selector(hb_motionEnded:withEvent:));
     HBInstallNetworkHook();
+    HBLog(@"bundle %@ v%@", NSBundle.mainBundle.bundleIdentifier, [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"]);
+    NSSetUncaughtExceptionHandler(&HBUncaught);
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:nil
-                                                  usingBlock:^(NSNotification *n) { HBInstallNetworkHook(); }];
+                                                  usingBlock:^(NSNotification *n) {
+        HBInstallNetworkHook();
+        HBLog(@"didFinishLaunching");
+        // If the UI is still blank after 10 s, show what happened so it can be fixed.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ HBMaybeShowDiag(); });
+    }];
 }
