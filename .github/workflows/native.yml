@@ -1,0 +1,95 @@
+name: Build HBOLT Native IPA
+
+# Native Swift build: official Telegram-iOS source + HBOLT changes from native/.
+on:
+  push:
+    branches: [main]
+    paths: ["native/**", ".github/workflows/native.yml"]
+  workflow_dispatch:
+
+jobs:
+  ipa:
+    runs-on: macos-26
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick newest Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$X"
+          xcodebuild -version
+          df -h /
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /Users/runner/Library/Android /usr/local/share/dotnet /opt/hostedtoolcache/CodeQL || true
+          ls -d /Applications/Xcode_*.app | sort -V | head -n -1 | xargs -r sudo rm -rf || true
+          df -h /
+
+      - name: Fetch Telegram-iOS source
+        run: |
+          REF=$(grep -v '^#' native/upstream.txt | head -1)
+          git init tgios && cd tgios
+          git remote add origin https://github.com/TelegramMessenger/Telegram-iOS.git
+          git fetch --depth 1 origin "$REF" || git fetch --depth 50 origin master
+          git checkout FETCH_HEAD 2>/dev/null || git checkout "$REF"
+          git submodule update --init --recursive --depth 1 --jobs 8
+
+      - name: Apply HBOLT changes
+        run: native/apply-hbolt.sh tgios
+
+      - name: Configuration
+        env:
+          API_ID: ${{ secrets.TG_API_ID }}
+          API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          if [ -z "$API_ID" ] || [ -z "$API_HASH" ]; then
+            echo "::warning::TG_API_ID / TG_API_HASH secrets missing — compile-test build only (login will not work)"
+            API_ID=0; API_HASH=00000000000000000000000000000000
+          fi
+          mkdir -p cfg
+          cat > cfg/configuration.json <<JSON
+          {
+            "bundle_id": "ph.telegra.Telegraph",
+            "api_id": "$API_ID",
+            "api_hash": "$API_HASH",
+            "team_id": "C67CF9S4VU",
+            "app_center_id": "0",
+            "is_internal_build": "false",
+            "is_appstore_build": "false",
+            "appstore_id": "0",
+            "app_specific_url_scheme": "tg",
+            "premium_iap_product_id": "",
+            "enable_siri": false,
+            "enable_icloud": false
+          }
+          JSON
+
+      - name: Build (Bazel, release_arm64, fake codesigning — re-sign on device)
+        working-directory: tgios
+        shell: bash
+        run: |
+          python3 build-system/Make/Make.py \
+            --overrideXcodeVersion --overrideBazelVersion \
+            --cacheDir="$HOME/telegram-bazel-cache" \
+            build \
+            --configurationPath="$GITHUB_WORKSPACE/cfg/configuration.json" \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --buildNumber=${{ github.run_number }} \
+            --configuration=release_arm64 2>&1 | tail -n 400
+          find bazel-bin -name "*.ipa" | head
+
+      - name: Package
+        run: |
+          IPA=$(find tgios/bazel-bin -name "Telegram.ipa" | head -1)
+          test -n "$IPA"
+          cp "$IPA" "HBOLT-Native-${{ github.run_number }}.ipa"
+          ls -la *.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HBOLT-Native-ipa
+          path: HBOLT-Native-*.ipa
+          retention-days: 30
