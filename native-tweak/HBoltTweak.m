@@ -173,15 +173,22 @@ static NSURL *HB_container(id self, SEL _cmd, NSString *groupId) {
 }
 
 #pragma mark - Shake menu
-@interface UIWindow (HBolt)
+// Defined on UIResponder (not just UIWindow): the shake event travels the whole
+// responder chain (UIWindowScene included), so the swizzled selector must exist
+// on every responder or UIKit raises "unrecognized selector".
+static BOOL gMenuOpen = NO;
+@interface UIResponder (HBolt)
 @end
-@implementation UIWindow (HBolt)
+@implementation UIResponder (HBolt)
 - (void)hb_motionEnded:(UIEventSubtype)motion withEvent:(UIEvent *)event {
     [self hb_motionEnded:motion withEvent:event];
-    if (motion != UIEventSubtypeMotionShake) return;
-    UIViewController *top = self.rootViewController;
+    if (motion != UIEventSubtypeMotionShake || gMenuOpen) return;
+    UIWindow *w = HBKeyWindow();
+    UIViewController *top = w.rootViewController;
+    if (!top) return;
     while (top.presentedViewController) top = top.presentedViewController;
     if ([top isKindOfClass:[UIAlertController class]]) return;
+    gMenuOpen = YES;
     NSArray *items = @[ @[@"ghost", @"👻 وضع الشبح (الكل)"], @[@"ghost.read", @"عدم إرسال القراءة"], @[@"ghost.online", @"إخفاء متصل الآن"],
                         @[@"ghost.typing", @"إخفاء يكتب…"], @[@"ghost.stories", @"مشاهدة الستوري سرًا"] ];
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"HBolt"
@@ -192,9 +199,9 @@ static NSURL *HB_container(id self, SEL _cmd, NSString *groupId) {
         BOOL on = HBOn(key, YES);
         [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@ %@", on ? @"✅" : @"⬜️", it[1]]
                                               style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *x) { HBSet(key, !on); }]];
+                                            handler:^(UIAlertAction *x) { HBSet(key, !on); gMenuOpen = NO; }]];
     }
-    [a addAction:[UIAlertAction actionWithTitle:@"إغلاق" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"إغلاق" style:UIAlertActionStyleCancel handler:^(UIAlertAction *x) { gMenuOpen = NO; }]];
     a.popoverPresentationController.sourceView = top.view;
     a.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(top.view.bounds), CGRectGetMidY(top.view.bounds), 1, 1);
     [top presentViewController:a animated:YES completion:nil];
@@ -292,7 +299,7 @@ static void HBInstallNetworkHook(void) {
 __attribute__((constructor)) static void HBoltInit(void) {
     Method c = class_getInstanceMethod([NSFileManager class], @selector(containerURLForSecurityApplicationGroupIdentifier:));
     if (c) gOrigContainer = method_setImplementation(c, (IMP)HB_container);
-    HBSwizzle([UIWindow class], @selector(motionEnded:withEvent:), @selector(hb_motionEnded:withEvent:));
+    HBSwizzle([UIResponder class], @selector(motionEnded:withEvent:), @selector(hb_motionEnded:withEvent:));
     HBNeuterCloudKit();
     HBInstallNetworkHook();
     HBLog(@"bundle %@ v%@", NSBundle.mainBundle.bundleIdentifier, [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"]);
