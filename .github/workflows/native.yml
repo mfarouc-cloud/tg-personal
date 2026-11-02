@@ -97,13 +97,13 @@ jobs:
             --codesigningInformationPath=build-system/fake-codesigning \
             --buildNumber=${{ github.run_number }} \
             --configuration=release_arm64 2>&1 | tail -n 400
-          find bazel-bin -name "*.ipa" | head
+          find -L bazel-bin/Telegram -maxdepth 1 -name "*.ipa"
 
       - name: Package HBOLT-Native-Full.ipa (extensions stripped)
         run: |
-          IPA=$(find tgios/bazel-bin -name "Telegram.ipa" | head -1)
+          IPA=$(find -L tgios/bazel-bin/Telegram -maxdepth 1 -name "*.ipa" | head -1); echo "IPA=$IPA"
           test -n "$IPA"
-          rm -rf pkg && mkdir pkg && cd pkg && unzip -q "../$IPA"
+          rm -rf pkg && mkdir pkg && cd pkg && unzip -q "$GITHUB_WORKSPACE/$IPA"
           APP=$(ls -d Payload/*.app)
           # No app extensions / watch app: they need entitlements a sideload cert can't give.
           rm -rf "$APP/PlugIns" "$APP/Watch" "$APP/_CodeSignature" "$APP/embedded.mobileprovision"
