@@ -1,0 +1,59 @@
+diff --git a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift
+index d64d6c4d0..fc215a274 100644
+--- a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
++++ b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
+@@ -460,6 +460,7 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+                     switch id {
+                     case 1: HBOLTSettings.keepDeleted = value
+                     case 2: HBOLTSettings.bypassProtection = value
++                    case 3: HBOLTSettings.hideSponsored = value
+                     default: break
+                     }
+                 })
+@@ -858,6 +859,7 @@ private func privacyAndSecurityControllerEntries(
+     entries.append(.hboltGhostMode("👻 Ghost Mode (HBOLT)", HBOLTSettings.ghostMode))
+     entries.append(.hboltSwitch(1, "🗂 Keep deleted messages (HBOLT)", HBOLTSettings.keepDeleted))
+     entries.append(.hboltSwitch(2, "🔓 Save from protected chats (HBOLT)", HBOLTSettings.bypassProtection))
++    entries.append(.hboltSwitch(3, "🚫 Hide sponsored messages (HBOLT)", HBOLTSettings.hideSponsored))
+ 
+     return entries
+ }
+diff --git a/submodules/TelegramCore/Sources/HBOLTSettings.swift b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+index abd424ec9..69b31efc4 100644
+--- a/submodules/TelegramCore/Sources/HBOLTSettings.swift
++++ b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+@@ -4,7 +4,7 @@ import Foundation
+ public enum HBOLTSettings {
+     private static let defaults: UserDefaults = {
+         let d = UserDefaults.standard
+-        d.register(defaults: ["hbolt.keepDeleted": true, "hbolt.bypassProtection": true])
++        d.register(defaults: ["hbolt.keepDeleted": true, "hbolt.bypassProtection": true, "hbolt.hideSponsored": true])
+         return d
+     }()
+ 
+@@ -20,6 +20,12 @@ public enum HBOLTSettings {
+         set { defaults.set(newValue, forKey: "hbolt.bypassProtection") }
+     }
+ 
++    /// Don't fetch or show sponsored messages in channels.
++    public static var hideSponsored: Bool {
++        get { return defaults.bool(forKey: "hbolt.hideSponsored") }
++        set { defaults.set(newValue, forKey: "hbolt.hideSponsored") }
++    }
++
+     /// Expired-link recovery: invite hash → peer id seen earlier for that link.
+     public static func rememberInvite(hash: String, peerId: Int64) {
+         var map = defaults.dictionary(forKey: "hbolt.inviteCache") as? [String: Int64] ?? [:]
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Messages/AdMessages.swift b/submodules/TelegramCore/Sources/TelegramEngine/Messages/AdMessages.swift
+index 8c48207f8..24182e3ac 100644
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Messages/AdMessages.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Messages/AdMessages.swift
+@@ -491,7 +491,7 @@ private class AdMessagesHistoryContextImpl {
+             return transaction.getPeer(peerId).flatMap(apiInputPeer)
+         }
+         |> mapToSignal { inputPeer -> Signal<(interPostInterval: Int32?, startDelay: Int32?, betweenDelay: Int32?, messages: [Message]), NoError> in
+-            guard let inputPeer else {
++            guard let inputPeer, !HBOLTSettings.hideSponsored else {
+                 return .single((nil, nil, nil, []))
+             }
+             var flags: Int32 = 0

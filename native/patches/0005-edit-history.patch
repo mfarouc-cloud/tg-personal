@@ -1,0 +1,125 @@
+diff --git a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift
+index fc215a274..9442e9f92 100644
+--- a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
++++ b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
+@@ -461,6 +461,7 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+                     case 1: HBOLTSettings.keepDeleted = value
+                     case 2: HBOLTSettings.bypassProtection = value
+                     case 3: HBOLTSettings.hideSponsored = value
++                    case 4: HBOLTSettings.keepEdits = value
+                     default: break
+                     }
+                 })
+@@ -860,6 +861,7 @@ private func privacyAndSecurityControllerEntries(
+     entries.append(.hboltSwitch(1, "🗂 Keep deleted messages (HBOLT)", HBOLTSettings.keepDeleted))
+     entries.append(.hboltSwitch(2, "🔓 Save from protected chats (HBOLT)", HBOLTSettings.bypassProtection))
+     entries.append(.hboltSwitch(3, "🚫 Hide sponsored messages (HBOLT)", HBOLTSettings.hideSponsored))
++    entries.append(.hboltSwitch(4, "🕘 Keep edit history (HBOLT)", HBOLTSettings.keepEdits))
+ 
+     return entries
+ }
+diff --git a/submodules/TelegramCore/Sources/HBOLTSettings.swift b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+index 69b31efc4..f27967e28 100644
+--- a/submodules/TelegramCore/Sources/HBOLTSettings.swift
++++ b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+@@ -4,7 +4,7 @@ import Foundation
+ public enum HBOLTSettings {
+     private static let defaults: UserDefaults = {
+         let d = UserDefaults.standard
+-        d.register(defaults: ["hbolt.keepDeleted": true, "hbolt.bypassProtection": true, "hbolt.hideSponsored": true])
++        d.register(defaults: ["hbolt.keepEdits": true, "hbolt.keepDeleted": true, "hbolt.bypassProtection": true, "hbolt.hideSponsored": true])
+         return d
+     }()
+ 
+@@ -20,6 +20,51 @@ public enum HBOLTSettings {
+         set { defaults.set(newValue, forKey: "hbolt.bypassProtection") }
+     }
+ 
++    /// Keep the previous text of messages that get edited (viewable from the message menu).
++    public static var keepEdits: Bool {
++        get { return defaults.bool(forKey: "hbolt.keepEdits") }
++        set { defaults.set(newValue, forKey: "hbolt.keepEdits") }
++    }
++
++    private static let editsQueue = DispatchQueue(label: "hbolt.edits")
++    private static var editsCache: [String: [String]]?
++    private static var editsURL: URL? {
++        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
++        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
++        return base.appendingPathComponent("hbolt-edit-history.json")
++    }
++    private static func loadEdits() -> [String: [String]] {
++        if let c = editsCache { return c }
++        var result: [String: [String]] = [:]
++        if let url = editsURL, let data = try? Data(contentsOf: url), let decoded = try? JSONDecoder().decode([String: [String]].self, from: data) {
++            result = decoded
++        }
++        editsCache = result
++        return result
++    }
++
++    /// Called just before an edit replaces a message's text.
++    public static func recordEdit(peerId: Int64, messageId: Int32, oldText: String) {
++        guard keepEdits, !oldText.isEmpty else { return }
++        editsQueue.async {
++            var all = loadEdits()
++            let key = "\(peerId):\(messageId)"
++            var list = all[key] ?? []
++            if list.last == oldText { return }
++            list.append(oldText)
++            if list.count > 50 { list.removeFirst(list.count - 50) }
++            all[key] = list
++            if all.count > 20000, let k = all.keys.first { all.removeValue(forKey: k) }
++            editsCache = all
++            if let url = editsURL, let data = try? JSONEncoder().encode(all) { try? data.write(to: url, options: .atomic) }
++        }
++    }
++
++    /// Previous versions (oldest first) of a message's text.
++    public static func editHistory(peerId: Int64, messageId: Int32) -> [String] {
++        return editsQueue.sync { loadEdits()["\(peerId):\(messageId)"] ?? [] }
++    }
++
+     /// Don't fetch or show sponsored messages in channels.
+     public static var hideSponsored: Bool {
+         get { return defaults.bool(forKey: "hbolt.hideSponsored") }
+diff --git a/submodules/TelegramCore/Sources/State/AccountStateManagementUtils.swift b/submodules/TelegramCore/Sources/State/AccountStateManagementUtils.swift
+index 1743d208c..9343e05d9 100644
+--- a/submodules/TelegramCore/Sources/State/AccountStateManagementUtils.swift
++++ b/submodules/TelegramCore/Sources/State/AccountStateManagementUtils.swift
+@@ -4651,6 +4651,9 @@ func replayFinalState(
+             case let .EditMessage(id, message):
+                 var generatedEvent: (reactionAuthor: Peer, reaction: MessageReaction.Reaction, message: Message, timestamp: Int32)?
+                 transaction.updateMessage(id, update: { previousMessage in
++                    if previousMessage.text != message.text {
++                        HBOLTSettings.recordEdit(peerId: id.peerId.toInt64(), messageId: id.id, oldText: previousMessage.text)
++                    }
+                     var updatedFlags = message.flags
+                     var updatedLocalTags = message.localTags
+                     var updatedAttributes = message.attributes
+diff --git a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+index 1ade8c01d..7337b1669 100644
+--- a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
++++ b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+@@ -1347,6 +1347,21 @@ func contextMenuForChatPresentationInterfaceState(chatPresentationInterfaceState
+             }
+         }
+         
++        let hboltEdits = HBOLTSettings.editHistory(peerId: message.id.peerId.toInt64(), messageId: message.id.id)
++        if !hboltEdits.isEmpty {
++            actions.append(.action(ContextMenuActionItem(text: "🕘 Edit history (\(hboltEdits.count))", icon: { theme in
++                return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Edit"), color: theme.actionSheet.primaryTextColor)
++            }, action: { c, _ in
++                c?.dismiss(completion: {
++                    let presentationData = context.sharedContext.currentPresentationData.with { $0 }
++                    var lines: [String] = []
++                    for (index, text) in hboltEdits.enumerated() {
++                        lines.append("\(index + 1)) \(text)")
++                    }
++                    controllerInteraction.presentController(textAlertController(context: context, title: "Edit history", text: lines.joined(separator: "\n\n"), actions: [TextAlertAction(type: .defaultAction, title: presentationData.strings.Common_OK, action: {})]), nil)
++                })
++            })))
++        }
+         let isCopyProtected = chatPresentationInterfaceState.copyProtectionEnabled || message.isCopyProtected()
+         if !messageText.isEmpty || richMessageMarkdown != nil || (resourceAvailable && isImage) || diceEmoji != nil {
+             if !isExpired {
