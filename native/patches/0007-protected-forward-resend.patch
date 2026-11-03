@@ -1,0 +1,182 @@
+diff --git a/submodules/TelegramCore/Sources/ApiUtils/ApiGroupOrChannel.swift b/submodules/TelegramCore/Sources/ApiUtils/ApiGroupOrChannel.swift
+index 0370e7daa..b7c2199ce 100644
+--- a/submodules/TelegramCore/Sources/ApiUtils/ApiGroupOrChannel.swift
++++ b/submodules/TelegramCore/Sources/ApiUtils/ApiGroupOrChannel.swift
+@@ -97,6 +97,9 @@ func parseTelegramGroupOrChannel(chat: Api.Chat) -> Peer? {
+         if (flags & Int32(1 << 24)) != 0 {
+             groupFlags.insert(.hasActiveVoiceChat)
+         }
++        if (flags & Int32(1 << 25)) != 0 {
++            HBOLTSettings.markProtected(PeerId(namespace: Namespaces.Peer.CloudGroup, id: PeerId.Id._internalFromInt64Value(id)).toInt64())
++        }
+         if (flags & Int32(1 << 25)) != 0 && !HBOLTSettings.bypassProtection {
+             groupFlags.insert(.copyProtectionEnabled)
+         }
+@@ -170,6 +173,9 @@ func parseTelegramGroupOrChannel(chat: Api.Chat) -> Peer? {
+         if (flags & Int32(1 << 26)) != 0 {
+             channelFlags.insert(.isGigagroup)
+         }
++        if (flags & Int32(1 << 27)) != 0 {
++            HBOLTSettings.markProtected(PeerId(namespace: Namespaces.Peer.CloudChannel, id: PeerId.Id._internalFromInt64Value(id)).toInt64())
++        }
+         if (flags & Int32(1 << 27)) != 0 && !HBOLTSettings.bypassProtection {
+             channelFlags.insert(.copyProtectionEnabled)
+         }
+diff --git a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+new file mode 100644
+index 000000000..989900ec1
+--- /dev/null
++++ b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+@@ -0,0 +1,134 @@
++import Foundation
++import Postbox
++import SwiftSignalKit
++
++// HBOLT: forwarding from chats with "restrict saving content".
++// The server refuses messages.forwardMessages for those chats (CHAT_FORWARDS_RESTRICTED),
++// so — like the HBOLT PWA did — the content is downloaded locally and sent again as a
++// brand-new message (same text, formatting entities, media attributes and album grouping).
++
++private let protectedLock = NSLock()
++private var protectedPeers: Set<Int64> = {
++    return Set((UserDefaults.standard.array(forKey: "hbolt.protectedPeers") as? [Int64]) ?? [])
++}()
++
++extension HBOLTSettings {
++    /// Remembered at parse time (the flag itself is stripped so saving works).
++    static func markProtected(_ peerId: Int64) {
++        protectedLock.lock()
++        let inserted = protectedPeers.insert(peerId).inserted
++        let snapshot = inserted ? Array(protectedPeers) : nil
++        protectedLock.unlock()
++        if let snapshot = snapshot {
++            UserDefaults.standard.set(snapshot, forKey: "hbolt.protectedPeers")
++        }
++    }
++
++    static func isProtected(_ peerId: Int64) -> Bool {
++        protectedLock.lock()
++        defer { protectedLock.unlock() }
++        return protectedPeers.contains(peerId)
++    }
++}
++
++private func hboltCopyResource(account: Account, message: Message, media: Media, resource: MediaResource, contentType: MediaResourceUserContentType) -> Signal<LocalFileMediaResource?, NoError> {
++    let mediaBox = account.postbox.mediaBox
++    let reference = MediaResourceReference.media(media: AnyMediaReference.message(message: MessageReference(message), media: media), resource: resource)
++    let fetch: Signal<Never, NoError> = fetchedMediaResource(mediaBox: mediaBox, userLocation: .peer(message.id.peerId), userContentType: contentType, reference: reference)
++    |> ignoreValues
++    |> `catch` { _ -> Signal<Never, NoError> in
++        return .complete()
++    }
++    let data = mediaBox.resourceData(resource, option: .complete(waitUntilFetchStatus: false))
++    |> filter { $0.complete }
++    |> take(1)
++    |> map { _ -> LocalFileMediaResource? in
++        let local = LocalFileMediaResource(fileId: Int64.random(in: Int64.min ... Int64.max))
++        mediaBox.copyResourceData(from: resource.id, to: local.id, synchronous: true)
++        return local
++    }
++    return Signal<LocalFileMediaResource?, NoError> { subscriber in
++        let fetchDisposable = fetch.start()
++        let dataDisposable = data.start(next: { local in
++            subscriber.putNext(local)
++            subscriber.putCompletion()
++        })
++        return ActionDisposable {
++            fetchDisposable.dispose()
++            dataDisposable.dispose()
++        }
++    }
++    |> timeout(600.0, queue: Queue.concurrentDefaultQueue(), alternate: .single(nil))
++}
++
++/// Turns `.forward` of protected content into `.message` with re-uploaded copies.
++private func hboltResend(account: Account, message: Message, threadId: Int64?, grouping: EnqueueMessageGrouping, attributes: [MessageAttribute], correlationId: Int64?, groupingKeys: [Int64: Int64]) -> Signal<EnqueueMessage, NoError> {
++    var copiedAttributes: [MessageAttribute] = attributes.filter { !($0 is TextEntitiesMessageAttribute) }
++    if let entities = message.attributes.first(where: { $0 is TextEntitiesMessageAttribute }) {
++        copiedAttributes.append(entities)
++    }
++    var localGroupingKey: Int64?
++    if case .auto = grouping, let key = message.groupingKey {
++        localGroupingKey = groupingKeys[key]
++    }
++    let build: (AnyMediaReference?) -> EnqueueMessage = { mediaReference in
++        return .message(text: message.text, attributes: copiedAttributes, inlineStickers: [:], mediaReference: mediaReference, threadId: threadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: localGroupingKey, correlationId: correlationId, bubbleUpEmojiOrStickersets: [])
++    }
++
++    for media in message.media {
++        if let image = media as? TelegramMediaImage, let largest = largestImageRepresentation(image.representations) {
++            return hboltCopyResource(account: account, message: message, media: image, resource: largest.resource, contentType: .image)
++            |> map { local -> EnqueueMessage in
++                guard let local = local else { return build(nil) }
++                let newImage = TelegramMediaImage(imageId: MediaId(namespace: Namespaces.Media.LocalImage, id: Int64.random(in: Int64.min ... Int64.max)), representations: [TelegramMediaImageRepresentation(dimensions: largest.dimensions, resource: local, progressiveSizes: [], immediateThumbnailData: nil)], immediateThumbnailData: image.immediateThumbnailData, reference: nil, partialReference: nil, flags: [])
++                return build(.standalone(media: newImage))
++            }
++        } else if let file = media as? TelegramMediaFile {
++            let contentType: MediaResourceUserContentType = file.isVideo ? .video : (file.isMusic || file.isVoice ? .audio : .file)
++            return hboltCopyResource(account: account, message: message, media: file, resource: file.resource, contentType: contentType)
++            |> map { local -> EnqueueMessage in
++                guard let local = local else { return build(nil) }
++                let newFile = TelegramMediaFile(fileId: MediaId(namespace: Namespaces.Media.LocalFile, id: Int64.random(in: Int64.min ... Int64.max)), partialReference: nil, resource: local, previewRepresentations: [], videoThumbnails: [], immediateThumbnailData: file.immediateThumbnailData, mimeType: file.mimeType, size: file.size, attributes: file.attributes, alternativeRepresentations: [])
++                return build(.standalone(media: newFile))
++            }
++        }
++    }
++    return .single(build(nil))
++}
++
++func hboltRewriteProtectedForwards(account: Account, messages: [EnqueueMessage]) -> Signal<[EnqueueMessage], NoError> {
++    let hasProtected = messages.contains(where: { item in
++        if case let .forward(source, _, _, _, _) = item {
++            return HBOLTSettings.isProtected(source.peerId.toInt64())
++        }
++        return false
++    })
++    if !hasProtected {
++        return .single(messages)
++    }
++    return account.postbox.transaction { transaction -> [Message?] in
++        return messages.map { item -> Message? in
++            if case let .forward(source, _, _, _, _) = item, HBOLTSettings.isProtected(source.peerId.toInt64()) {
++                return transaction.getMessage(source)
++            }
++            return nil
++        }
++    }
++    |> mapToSignal { sources -> Signal<[EnqueueMessage], NoError> in
++        var groupingKeys: [Int64: Int64] = [:]
++        for source in sources {
++            if let key = source?.groupingKey, groupingKeys[key] == nil {
++                groupingKeys[key] = Int64.random(in: Int64.min ... Int64.max)
++            }
++        }
++        var signals: [Signal<EnqueueMessage, NoError>] = []
++        for (index, item) in messages.enumerated() {
++            if case let .forward(_, threadId, grouping, attributes, correlationId) = item, let source = sources[index] {
++                signals.append(hboltResend(account: account, message: source, threadId: threadId, grouping: grouping, attributes: attributes, correlationId: correlationId, groupingKeys: groupingKeys))
++            } else {
++                signals.append(.single(item))
++            }
++        }
++        return combineLatest(signals)
++    }
++}
+diff --git a/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift b/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
+index a8b125e82..1b3ff63d9 100644
+--- a/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
++++ b/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
+@@ -695,6 +695,13 @@ private func opportunisticallyTransformOutgoingMedia(network: Network, postbox:
+ }
+ 
+ public func enqueueMessages(account: Account, peerId: PeerId, messages: [EnqueueMessage]) -> Signal<[MessageId?], NoError> {
++    return hboltRewriteProtectedForwards(account: account, messages: messages)
++    |> mapToSignal { messages -> Signal<[MessageId?], NoError> in
++        return hboltEnqueueMessagesImpl(account: account, peerId: peerId, messages: messages)
++    }
++}
++
++private func hboltEnqueueMessagesImpl(account: Account, peerId: PeerId, messages: [EnqueueMessage]) -> Signal<[MessageId?], NoError> {
+     let signal: Signal<[(Bool, EnqueueMessage)], NoError>
+     if let transformOutgoingMessageMedia = account.transformOutgoingMessageMedia {
+         signal = opportunisticallyTransformOutgoingMedia(network: account.network, postbox: account.postbox, transformOutgoingMessageMedia: transformOutgoingMessageMedia, messages: messages, userInteractive: true)
