@@ -1,0 +1,252 @@
+diff --git a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift
+index 41d7d9e11..d64d6c4d0 100644
+--- a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
++++ b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
+@@ -137,6 +137,7 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+     case dataSettingsInfo(PresentationTheme, String)
+     case openLinksIn(PresentationTheme, String, String)
+     case hboltGhostMode(String, Bool)
++    case hboltSwitch(Int32, String, Bool)
+     
+     var section: ItemListSectionId {
+         switch self {
+@@ -152,7 +153,7 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+             return PrivacyAndSecuritySection.account.rawValue
+         case .dataSettings, .dataSettingsInfo:
+             return PrivacyAndSecuritySection.dataSettings.rawValue
+-        case .openLinksIn, .hboltGhostMode:
++        case .openLinksIn, .hboltGhostMode, .hboltSwitch:
+             return PrivacyAndSecuritySection.linkHandling.rawValue
+         }
+     }
+@@ -227,11 +228,19 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+                 return 33
+             case .hboltGhostMode:
+                 return 100
++            case let .hboltSwitch(id, _, _):
++                return 100 + id
+         }
+     }
+     
+     static func ==(lhs: PrivacyAndSecurityEntry, rhs: PrivacyAndSecurityEntry) -> Bool {
+         switch lhs {
++            case let .hboltSwitch(lhsId, lhsText, lhsValue):
++                if case let .hboltSwitch(rhsId, rhsText, rhsValue) = rhs, lhsId == rhsId, lhsText == rhsText, lhsValue == rhsValue {
++                    return true
++                } else {
++                    return false
++                }
+             case let .hboltGhostMode(lhsText, lhsValue):
+                 if case let .hboltGhostMode(rhsText, rhsValue) = rhs, lhsText == rhsText, lhsValue == rhsValue {
+                     return true
+@@ -446,6 +455,14 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+     func item(presentationData: ItemListPresentationData, arguments: Any) -> ListViewItem {
+         let arguments = arguments as! PrivacyAndSecurityControllerArguments
+         switch self {
++            case let .hboltSwitch(id, text, value):
++                return ItemListSwitchItem(presentationData: presentationData, systemStyle: .glass, title: text, value: value, sectionId: self.section, style: .blocks, updated: { value in
++                    switch id {
++                    case 1: HBOLTSettings.keepDeleted = value
++                    case 2: HBOLTSettings.bypassProtection = value
++                    default: break
++                    }
++                })
+             case let .hboltGhostMode(text, value):
+                 let _ = arguments
+                 return ItemListSwitchItem(presentationData: presentationData, systemStyle: .glass, title: text, value: value, sectionId: self.section, style: .blocks, updated: { value in
+@@ -839,6 +856,8 @@ private func privacyAndSecurityControllerEntries(
+     
+     entries.append(.openLinksIn(presentationData.theme, presentationData.strings.ChatSettings_OpenLinksIn, defaultWebBrowser))
+     entries.append(.hboltGhostMode("👻 Ghost Mode (HBOLT)", HBOLTSettings.ghostMode))
++    entries.append(.hboltSwitch(1, "🗂 Keep deleted messages (HBOLT)", HBOLTSettings.keepDeleted))
++    entries.append(.hboltSwitch(2, "🔓 Save from protected chats (HBOLT)", HBOLTSettings.bypassProtection))
+ 
+     return entries
+ }
+diff --git a/submodules/TelegramCore/Sources/ApiUtils/ApiGroupOrChannel.swift b/submodules/TelegramCore/Sources/ApiUtils/ApiGroupOrChannel.swift
+index cb317f307..0370e7daa 100644
+--- a/submodules/TelegramCore/Sources/ApiUtils/ApiGroupOrChannel.swift
++++ b/submodules/TelegramCore/Sources/ApiUtils/ApiGroupOrChannel.swift
+@@ -97,7 +97,7 @@ func parseTelegramGroupOrChannel(chat: Api.Chat) -> Peer? {
+         if (flags & Int32(1 << 24)) != 0 {
+             groupFlags.insert(.hasActiveVoiceChat)
+         }
+-        if (flags & Int32(1 << 25)) != 0 {
++        if (flags & Int32(1 << 25)) != 0 && !HBOLTSettings.bypassProtection {
+             groupFlags.insert(.copyProtectionEnabled)
+         }
+         return TelegramGroup(id: PeerId(namespace: Namespaces.Peer.CloudGroup, id: PeerId.Id._internalFromInt64Value(id)), title: title, photo: imageRepresentationsForApiChatPhoto(photo), participantCount: Int(participantsCount), role: role, membership: left ? .Left : .Member, flags: groupFlags, defaultBannedRights: defaultBannedRights.flatMap(TelegramChatBannedRights.init(apiBannedRights:)), migrationReference: migrationReference, creationDate: date, version: Int(version))
+@@ -170,7 +170,7 @@ func parseTelegramGroupOrChannel(chat: Api.Chat) -> Peer? {
+         if (flags & Int32(1 << 26)) != 0 {
+             channelFlags.insert(.isGigagroup)
+         }
+-        if (flags & Int32(1 << 27)) != 0 {
++        if (flags & Int32(1 << 27)) != 0 && !HBOLTSettings.bypassProtection {
+             channelFlags.insert(.copyProtectionEnabled)
+         }
+         if (flags & Int32(1 << 28)) != 0 {
+diff --git a/submodules/TelegramCore/Sources/ApiUtils/StoreMessage_Telegram.swift b/submodules/TelegramCore/Sources/ApiUtils/StoreMessage_Telegram.swift
+index a7250984f..e2875631d 100644
+--- a/submodules/TelegramCore/Sources/ApiUtils/StoreMessage_Telegram.swift
++++ b/submodules/TelegramCore/Sources/ApiUtils/StoreMessage_Telegram.swift
+@@ -1491,7 +1491,7 @@ extension StoreMessage {
+                     storeFlags.insert(.CountedAsIncoming)
+                 }
+             
+-                if (flags & (1 << 26)) != 0 {
++                if (flags & (1 << 26)) != 0 && !HBOLTSettings.bypassProtection {
+                     storeFlags.insert(.CopyProtected)
+                 }
+             
+@@ -1669,7 +1669,7 @@ extension StoreMessage {
+                     storeFlags.insert(.WasScheduled)
+                 }
+             
+-                if (flags & (1 << 26)) != 0 {
++                if (flags & (1 << 26)) != 0 && !HBOLTSettings.bypassProtection {
+                     storeFlags.insert(.CopyProtected)
+                 }
+             
+diff --git a/submodules/TelegramCore/Sources/HBOLTSettings.swift b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+index 15e10fb0e..abd424ec9 100644
+--- a/submodules/TelegramCore/Sources/HBOLTSettings.swift
++++ b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+@@ -2,7 +2,35 @@ import Foundation
+ 
+ /// HBOLT on-device feature switches (stored only in this app's UserDefaults).
+ public enum HBOLTSettings {
+-    private static let defaults = UserDefaults.standard
++    private static let defaults: UserDefaults = {
++        let d = UserDefaults.standard
++        d.register(defaults: ["hbolt.keepDeleted": true, "hbolt.bypassProtection": true])
++        return d
++    }()
++
++    /// Keep messages that others delete (local history): server delete updates are ignored.
++    public static var keepDeleted: Bool {
++        get { return defaults.bool(forKey: "hbolt.keepDeleted") }
++        set { defaults.set(newValue, forKey: "hbolt.keepDeleted") }
++    }
++
++    /// Ignore "restrict saving content" so media can be saved/copied/shared (applies to newly loaded data).
++    public static var bypassProtection: Bool {
++        get { return defaults.bool(forKey: "hbolt.bypassProtection") }
++        set { defaults.set(newValue, forKey: "hbolt.bypassProtection") }
++    }
++
++    /// Expired-link recovery: invite hash → peer id seen earlier for that link.
++    public static func rememberInvite(hash: String, peerId: Int64) {
++        var map = defaults.dictionary(forKey: "hbolt.inviteCache") as? [String: Int64] ?? [:]
++        map[hash] = peerId
++        if map.count > 5000 { map.removeValue(forKey: map.keys.first!) }
++        defaults.set(map, forKey: "hbolt.inviteCache")
++    }
++
++    public static func rememberedInvite(hash: String) -> Int64? {
++        return (defaults.dictionary(forKey: "hbolt.inviteCache") as? [String: Int64])?[hash]
++    }
+ 
+     /// Ghost Mode: never appear online, never send "typing…", never send read receipts.
+     public static var ghostMode: Bool {
+diff --git a/submodules/TelegramCore/Sources/State/AccountStateManagementUtils.swift b/submodules/TelegramCore/Sources/State/AccountStateManagementUtils.swift
+index ba4569edf..1743d208c 100644
+--- a/submodules/TelegramCore/Sources/State/AccountStateManagementUtils.swift
++++ b/submodules/TelegramCore/Sources/State/AccountStateManagementUtils.swift
+@@ -972,7 +972,9 @@ private func finalStateWithUpdatesAndServerTime(accountPeerId: PeerId, postbox:
+                     if previousState.pts >= pts {
+                         Logger.shared.log("State", "channel \(peerId) (\((updatedState.peers[peerId] as? TelegramChannel)?.title ?? "nil")) skip old delete update")
+                     } else if previousState.pts + ptsCount == pts {
+-                        updatedState.deleteMessages(messages.map({ MessageId(peerId: peerId, namespace: Namespaces.Message.Cloud, id: $0) }))
++                        if !HBOLTSettings.keepDeleted {
++                            updatedState.deleteMessages(messages.map({ MessageId(peerId: peerId, namespace: Namespaces.Message.Cloud, id: $0) }))
++                        }
+                         updatedState.updateChannelState(peerId, pts: pts)
+                     } else {
+                         if !missingUpdatesFromChannels.contains(peerId) {
+@@ -1062,7 +1064,9 @@ private func finalStateWithUpdatesAndServerTime(accountPeerId: PeerId, postbox:
+                 let peerId = PeerId(namespace: Namespaces.Peer.CloudChannel, id: PeerId.Id._internalFromInt64Value(channelId))
+                 updatedState.updateMinAvailableMessage(MessageId(peerId: peerId, namespace: Namespaces.Message.Cloud, id: minId))
+             case let .updateDeleteMessages(updateDeleteMessagesData):
+-                updatedState.deleteMessagesWithGlobalIds(updateDeleteMessagesData.messages)
++                if !HBOLTSettings.keepDeleted {
++                    updatedState.deleteMessagesWithGlobalIds(updateDeleteMessagesData.messages)
++                }
+             case let .updatePinnedMessages(updatePinnedMessagesData):
+                 let (flags, peer, messages) = (updatePinnedMessagesData.flags, updatePinnedMessagesData.peer, updatePinnedMessagesData.messages)
+                 let peerId = peer.peerId
+@@ -3555,7 +3559,9 @@ private func pollChannel(accountPeerId: PeerId, postbox: Postbox, network: Netwo
+                     switch update {
+                     case let .updateDeleteChannelMessages(updateDeleteChannelMessagesData):
+                         let peerId = peer.id
+-                        updatedState.deleteMessages(updateDeleteChannelMessagesData.messages.map({ MessageId(peerId: peerId, namespace: Namespaces.Message.Cloud, id: $0) }))
++                        if !HBOLTSettings.keepDeleted {
++                            updatedState.deleteMessages(updateDeleteChannelMessagesData.messages.map({ MessageId(peerId: peerId, namespace: Namespaces.Message.Cloud, id: $0) }))
++                        }
+                     case let .updateEditChannelMessage(updateEditChannelMessageData):
+                         let apiMessage = updateEditChannelMessageData.message
+                         var peerIsForum = peer.isForum
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift b/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
+index 051cb9b87..ccc032f97 100644
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
+@@ -193,6 +193,7 @@ func _internal_joinLinkInformation(_ hash: String, account: Account) -> Signal<E
+                 case let .chatInviteAlready(chatInviteAlreadyData):
+                     let chat = chatInviteAlreadyData.chat
+                     if let peer = parseTelegramGroupOrChannel(chat: chat) {
++                        HBOLTSettings.rememberInvite(hash: hash, peerId: peer.id.toInt64())
+                         return account.postbox.transaction({ (transaction) -> ExternalJoiningChatState in
+                             let parsedPeers = AccumulatedPeers(transaction: transaction, chats: [chat], users: [])
+                             updatePeers(transaction: transaction, accountPeerId: accountPeerId, peers: parsedPeers)
+@@ -204,6 +205,7 @@ func _internal_joinLinkInformation(_ hash: String, account: Account) -> Signal<E
+                 case let .chatInvitePeek(chatInvitePeekData):
+                     let (chat, expires) = (chatInvitePeekData.chat, chatInvitePeekData.expires)
+                     if let peer = parseTelegramGroupOrChannel(chat: chat) {
++                        HBOLTSettings.rememberInvite(hash: hash, peerId: peer.id.toInt64())
+                         return account.postbox.transaction({ (transaction) -> ExternalJoiningChatState in
+                             let parsedPeers = AccumulatedPeers(transaction: transaction, chats: [chat], users: [])
+                             updatePeers(transaction: transaction, accountPeerId: accountPeerId, peers: parsedPeers)
+@@ -215,6 +217,16 @@ func _internal_joinLinkInformation(_ hash: String, account: Account) -> Signal<E
+                     return .single(.invalidHash)
+             }
+         } else {
++            // HBOLT: expired/revoked link → open the chat this link pointed to before, if we know it.
++            if let cached = HBOLTSettings.rememberedInvite(hash: hash) {
++                return account.postbox.transaction({ transaction -> ExternalJoiningChatState in
++                    if let peer = transaction.getPeer(PeerId(cached)) {
++                        return .alreadyJoined(EnginePeer(peer))
++                    }
++                    return .invalidHash
++                })
++                |> castError(JoinLinkInfoError.self)
++            }
+             return .single(.invalidHash)
+         }
+     }
+diff --git a/submodules/TelegramCore/Sources/Utils/MessageUtils.swift b/submodules/TelegramCore/Sources/Utils/MessageUtils.swift
+index b7c6ae8cb..ad70b390b 100644
+--- a/submodules/TelegramCore/Sources/Utils/MessageUtils.swift
++++ b/submodules/TelegramCore/Sources/Utils/MessageUtils.swift
+@@ -536,6 +536,9 @@ public extension Message {
+     }
+     
+     func isCopyProtected() -> Bool {
++        if HBOLTSettings.bypassProtection {
++            return false
++        }
+         if self.flags.contains(.CopyProtected) {
+             return true
+         } else if let group = self.peers[self.id.peerId] as? TelegramGroup, group.flags.contains(.copyProtectionEnabled) {
+diff --git a/submodules/TelegramCore/Sources/Utils/PeerUtils.swift b/submodules/TelegramCore/Sources/Utils/PeerUtils.swift
+index 26cebdb4c..96ef538b5 100644
+--- a/submodules/TelegramCore/Sources/Utils/PeerUtils.swift
++++ b/submodules/TelegramCore/Sources/Utils/PeerUtils.swift
+@@ -252,6 +252,9 @@ public extension Peer {
+     }
+     
+     var isCopyProtectionEnabled: Bool {
++        if HBOLTSettings.bypassProtection {
++            return false
++        }
+         switch self {
+         case let group as TelegramGroup:
+             return group.flags.contains(.copyProtectionEnabled)
