@@ -1,0 +1,41 @@
+diff --git a/submodules/TelegramCore/Sources/State/ManagedSynchronizeConsumeMessageContentsOperations.swift b/submodules/TelegramCore/Sources/State/ManagedSynchronizeConsumeMessageContentsOperations.swift
+index f6df475fe..50b066edf 100644
+--- a/submodules/TelegramCore/Sources/State/ManagedSynchronizeConsumeMessageContentsOperations.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedSynchronizeConsumeMessageContentsOperations.swift
+@@ -110,6 +110,9 @@ func managedSynchronizeConsumeMessageContentOperations(postbox: Postbox, network
+ }
+ 
+ private func synchronizeConsumeMessageContents(transaction: Transaction, network: Network, stateManager: AccountStateManager, peerId: PeerId, operation: SynchronizeConsumeMessageContentsOperation) -> Signal<Void, NoError> {
++    if HBOLTSettings.ghostMode {
++        return .complete()
++    }
+     if peerId.namespace == Namespaces.Peer.CloudUser || peerId.namespace == Namespaces.Peer.CloudGroup {
+         return network.request(Api.functions.messages.readMessageContents(id: operation.messageIds.map { $0.id }))
+         |> map(Optional.init)
+diff --git a/submodules/TelegramCore/Sources/State/ManagedSynchronizeViewStoriesOperations.swift b/submodules/TelegramCore/Sources/State/ManagedSynchronizeViewStoriesOperations.swift
+index bebd6915a..6f07f9f11 100644
+--- a/submodules/TelegramCore/Sources/State/ManagedSynchronizeViewStoriesOperations.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedSynchronizeViewStoriesOperations.swift
+@@ -119,7 +119,7 @@ func managedSynchronizeViewStoriesOperations(postbox: Postbox, network: Network,
+ }
+ 
+ private func pushStoriesAreSeen(postbox: Postbox, network: Network, stateManager: AccountStateManager, peer: Peer, operation: SynchronizeViewStoriesOperation) -> Signal<Void, NoError> {
+-    guard let inputPeer = apiInputPeer(peer) else {
++    guard !HBOLTSettings.ghostMode, let inputPeer = apiInputPeer(peer) else {
+         return .complete()
+     }
+     return network.request(Api.functions.stories.readStories(peer: inputPeer, maxId: operation.storyId))
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Messages/MarkAllChatsAsRead.swift b/submodules/TelegramCore/Sources/TelegramEngine/Messages/MarkAllChatsAsRead.swift
+index 7d2937cd8..7121900fd 100644
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Messages/MarkAllChatsAsRead.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Messages/MarkAllChatsAsRead.swift
+@@ -19,6 +19,9 @@ func _internal_markAllChatsAsRead(postbox: Postbox, network: Network, stateManag
+         return postbox.transaction { transaction -> Signal<Void, NoError> in
+             var signals: [Signal<Void, NoError>] = []
+             for peer in result {
++                if HBOLTSettings.ghostMode {
++                    break
++                }
+                 switch peer {
+                     case let .dialogPeer(dialogPeerData):
+                         let peer = dialogPeerData.peer
