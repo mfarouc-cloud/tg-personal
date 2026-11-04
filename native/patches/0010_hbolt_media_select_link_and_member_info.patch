@@ -1,0 +1,186 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift b/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift
+index feac61a44..d2b1024c3 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift
+@@ -22,4 +22,24 @@ public extension HBOLTSettings {
+             return ids
+         }
+     }
++
++    /// Shared-media version: every message with the same media tags (photos/videos, files, links…) from `message` to the newest.
++    static func mediaIdsFromHereToLatest(account: Account, message: Message) -> Signal<[MessageId], NoError> {
++        let start = message.id
++        let tags = message.tags
++        if tags.isEmpty {
++            return messageIdsFromHereToLatest(account: account, from: start)
++        }
++        return account.postbox.transaction { transaction -> [MessageId] in
++            let indices = transaction.getMessageIndicesWithTag(peerId: start.peerId, threadId: nil, namespace: start.namespace, tag: tags)
++            var ids = indices.map { $0.id }.filter { $0.id >= start.id }
++            if ids.count > 5000 {
++                ids = Array(ids.sorted(by: { $0.id < $1.id }).prefix(5000))
++            }
++            if !ids.contains(start) {
++                ids.append(start)
++            }
++            return ids
++        }
++    }
+ }
+diff --git a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+index 74c019b93..66085b5fe 100644
+--- a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+@@ -14,7 +14,7 @@ private var protectedPeers: Set<Int64> = {
+ 
+ extension HBOLTSettings {
+     /// Remembered at parse time (the flag itself is stripped so saving works).
+-    static func markProtected(_ peerId: Int64) {
++    public static func markProtected(_ peerId: Int64) {
+         protectedLock.lock()
+         let inserted = protectedPeers.insert(peerId).inserted
+         let snapshot = inserted ? Array(protectedPeers) : nil
+@@ -24,7 +24,7 @@ extension HBOLTSettings {
+         }
+     }
+ 
+-    static func isProtected(_ peerId: Int64) -> Bool {
++    public static func isProtected(_ peerId: Int64) -> Bool {
+         protectedLock.lock()
+         defer { protectedLock.unlock() }
+         return protectedPeers.contains(peerId)
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift b/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
+index bc601873b..5771807fe 100644
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
+@@ -144,6 +144,7 @@ func _internal_joinChatInteractively(with hash: String, account: Account) -> Sig
+             let updates = data.updates
+             account.stateManager.addUpdates(updates)
+             if let peerId = apiUpdatesGroups(updates).first?.peerId {
++                HBOLTSettings.rememberInvite(hash: hash, peerId: peerId.toInt64())
+                 return account.postbox.multiplePeersView([peerId])
+                 |> castError(JoinLinkError.self)
+                 |> filter { view in
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Peers/UpdateCachedPeerData.swift b/submodules/TelegramCore/Sources/TelegramEngine/Peers/UpdateCachedPeerData.swift
+index d42e9b044..6c0e6beb4 100644
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Peers/UpdateCachedPeerData.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Peers/UpdateCachedPeerData.swift
+@@ -359,7 +359,10 @@ func _internal_fetchAndUpdateCachedPeerData(accountPeerId: PeerId, peerId rawPee
+                                         } else {
+                                             flags.remove(.myCopyProtectionEnabled)
+                                         }
+-                                        if copyProtectionEnabled {
++                                        if copyProtectionEnabled || myCopyProtectionEnabled {
++                                            HBOLTSettings.markProtected(peerId.toInt64())
++                                        }
++                                        if copyProtectionEnabled && !HBOLTSettings.bypassProtection {
+                                             flags.insert(.copyProtectionEnabled)
+                                         } else {
+                                             flags.remove(.copyProtectionEnabled)
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
+index 34f237709..288ca170c 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
+@@ -189,6 +189,36 @@ func infoItems(
+                 interaction.requestLayout(animated)
+             }))
+         }
++
++        // HBOLT: Extended info
++        do {
++            let hboltUserId = "\(user.id.id._internalGetInt64Value())"
++            var hboltLines: [String] = ["User ID: \(hboltUserId)"]
++            if let photoResource = user.photo.first?.resource as? CloudPeerPhotoSizeMediaResource {
++                hboltLines.append("Data center: DC\(photoResource.datacenterId)")
++            }
++            var hboltTags: [String] = []
++            if user.botInfo != nil { hboltTags.append("Bot") }
++            if user.flags.contains(.isPremium) { hboltTags.append("Premium") }
++            if user.flags.contains(.isVerified) { hboltTags.append("Verified") }
++            if user.flags.contains(.isScam) { hboltTags.append("Scam") }
++            if user.flags.contains(.isFake) { hboltTags.append("Fake") }
++            if user.flags.contains(.mutualContact) { hboltTags.append("Mutual contact") }
++            if !hboltTags.isEmpty {
++                hboltLines.append("Account: " + hboltTags.joined(separator: ", "))
++            }
++            if user.usernames.count > 1 {
++                hboltLines.append("Usernames: " + user.usernames.map { "@" + $0.username }.joined(separator: ", "))
++            }
++            if HBOLTSettings.isProtected(user.id.toInt64()) {
++                hboltLines.append("Protected content: yes")
++            }
++            items[currentPeerInfoSection]!.append(PeerInfoScreenLabeledValueItem(id: 9_100_001, label: "HBolt Extended Info", text: hboltLines.joined(separator: "\n"), textColor: .primary, textBehavior: .multiLine(maxLines: 20, enabledEntities: []), action: { _, _ in
++                UIPasteboard.general.string = hboltUserId
++            }, requestLayout: { animated in
++                interaction.requestLayout(animated)
++            }))
++        }
+         if let mainUsername = user.addressName {
+             var additionalUsernames: String?
+             let usernames = user.usernames.filter { $0.isActive && $0.username != mainUsername }
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreen.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreen.swift
+index 71918a2f5..75bfa955f 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreen.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreen.swift
+@@ -876,6 +876,23 @@ final class PeerInfoScreenNode: ViewControllerTracingNode, PeerInfoScreenNodePro
+                             }
+                         })
+                     })))
++                    if HBOLTSettings.bulkSelect {
++                        items.append(.action(ContextMenuActionItem(text: "☑️ Select from here to latest (HBOLT)", icon: { theme in generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/SelectAll"), color: theme.contextMenu.primaryColor) }, action: { c, _ in
++                            c?.dismiss(completion: {
++                                guard let strongSelf = self else {
++                                    return
++                                }
++                                let _ = (HBOLTSettings.mediaIdsFromHereToLatest(account: strongSelf.context.account, message: message)
++                                |> deliverOnMainQueue).startStandalone(next: { ids in
++                                    guard let strongSelf = self else {
++                                        return
++                                    }
++                                    strongSelf.chatInterfaceInteraction.toggleMessagesSelection(ids, true)
++                                    strongSelf.expandTabs(animated: true)
++                                })
++                            })
++                        })))
++                    }
+                 }
+                 
+                 let controller = makeContextController(presentationData: strongSelf.presentationData, source: .extracted(MessageContextExtractedContentSource(sourceNode: node)), items: .single(ContextController.Items(content: .list(items))), recognizer: nil, gesture: gesture)
+@@ -1000,6 +1017,24 @@ final class PeerInfoScreenNode: ViewControllerTracingNode, PeerInfoScreenNodePro
+                             strongSelf.expandTabs(animated: true)
+                             f(.default)
+                         })))
++                        if HBOLTSettings.bulkSelect {
++                            items.append(.action(ContextMenuActionItem(text: "☑️ Select from here to latest (HBOLT)", icon: { theme in
++                                return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/SelectAll"), color: theme.actionSheet.primaryTextColor)
++                            }, action: { _, f in
++                                f(.default)
++                                guard let strongSelf = self else {
++                                    return
++                                }
++                                let _ = (HBOLTSettings.mediaIdsFromHereToLatest(account: strongSelf.context.account, message: message)
++                                |> deliverOnMainQueue).startStandalone(next: { ids in
++                                    guard let strongSelf = self else {
++                                        return
++                                    }
++                                    strongSelf.chatInterfaceInteraction.toggleMessagesSelection(ids, true)
++                                    strongSelf.expandTabs(animated: true)
++                                })
++                            })))
++                        }
+                         
+                         return items
+                     }
+diff --git a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+index 2001c3adf..f1f71a07d 100644
+--- a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
++++ b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+@@ -2690,7 +2690,7 @@ func chatAvailableMessageActionsImpl(engine: TelegramEngine, accountPeerId: Engi
+                     isCopyProtected = true
+                 }
+                 
+-                if isPeerCopyProtected(message.id.peerId) == true {
++                if isPeerCopyProtected(message.id.peerId) == true && !HBOLTSettings.bypassProtection {
+                     isCopyProtected = true
+                 }
+                 
