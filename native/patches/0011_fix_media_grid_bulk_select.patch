@@ -1,0 +1,53 @@
+diff --git a/submodules/Postbox/Sources/Postbox.swift b/submodules/Postbox/Sources/Postbox.swift
+index 382555685..2974ad570 100644
+--- a/submodules/Postbox/Sources/Postbox.swift
++++ b/submodules/Postbox/Sources/Postbox.swift
+@@ -1065,6 +1065,15 @@ public final class Transaction {
+         return self.postbox?.pendingMessageActionsMetadataTable.getCount(.peerNamespaceAction(peerId, namespace, type))
+     }
+     
++    /// HBOLT: indices with `tag` starting at `from` (inclusive) going towards newer messages.
++    public func hboltLaterIndicesWithTag(peerId: PeerId, namespace: MessageId.Namespace, tag: MessageTags, from index: MessageIndex, limit: Int) -> [MessageIndex] {
++        assert(!self.disposed)
++        guard let postbox = self.postbox else {
++            return []
++        }
++        return postbox.messageHistoryTagsTable.laterIndices(tag: tag, peerId: peerId, namespace: namespace, index: index, includeFrom: true, count: limit)
++    }
++
+     public func getMessageIndicesWithTag(peerId: PeerId, threadId: Int64?, namespace: MessageId.Namespace, tag: MessageTags) -> [MessageIndex] {
+         assert(!self.disposed)
+         guard let postbox = self.postbox else {
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift b/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift
+index d2b1024c3..c41ae6835 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift
+@@ -23,21 +23,19 @@ public extension HBOLTSettings {
+         }
+     }
+ 
+-    /// Shared-media version: every message with the same media tags (photos/videos, files, links…) from `message` to the newest.
++    /// Shared-media version: same media kind (photos/videos, files, links, music, voice, GIFs)
++    /// from `message` up to the newest locally stored one, max 5000.
+     static func mediaIdsFromHereToLatest(account: Account, message: Message) -> Signal<[MessageId], NoError> {
+         let start = message.id
+-        let tags = message.tags
+-        if tags.isEmpty {
++        let startIndex = message.index
++        let preferred: [MessageTags] = [.photoOrVideo, .file, .webPage, .music, .voiceOrInstantVideo, .gif]
++        guard let tag = preferred.first(where: { message.tags.contains($0) }) else {
+             return messageIdsFromHereToLatest(account: account, from: start)
+         }
+         return account.postbox.transaction { transaction -> [MessageId] in
+-            let indices = transaction.getMessageIndicesWithTag(peerId: start.peerId, threadId: nil, namespace: start.namespace, tag: tags)
+-            var ids = indices.map { $0.id }.filter { $0.id >= start.id }
+-            if ids.count > 5000 {
+-                ids = Array(ids.sorted(by: { $0.id < $1.id }).prefix(5000))
+-            }
++            var ids = transaction.hboltLaterIndicesWithTag(peerId: start.peerId, namespace: start.namespace, tag: tag, from: startIndex, limit: 5000).map { $0.id }
+             if !ids.contains(start) {
+-                ids.append(start)
++                ids.insert(start, at: 0)
+             }
+             return ids
+         }
