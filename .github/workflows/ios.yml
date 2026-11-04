@@ -3,6 +3,7 @@ name: Build HBOLT IPA
 on:
   push:
     branches: [main]
+    paths-ignore: ["native/**", "native-tweak/**", ".github/workflows/native*.yml", "*.md"]
   workflow_dispatch:
     inputs:
       bundle_id:
