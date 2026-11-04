@@ -17,6 +17,38 @@ for f in glob.glob(os.path.join(t, "Telegram/Telegram-iOS/*.lproj/InfoPlist.stri
     if new != txt: open(f, "wb").write(new.encode(enc)); print("localized:", f)
 PY
 grep -q "<string>HBolt</string>" "$T/Telegram/BUILD" || { echo "branding patch failed"; exit 1; }
+# 1b) CFBundleName of the app itself
+python3 - "$T/Telegram/BUILD" <<'PY'
+import sys, re
+p = sys.argv[1]; s = open(p).read()
+s, n = re.subn(r"(<key>CFBundleName</key>\s*<string>)Telegram(</string>)", r"\1HBolt\2", s)
+open(p, "w").write(s); print("CFBundleName:", n)
+PY
+# 1c) App icon: dark HBolt bolt (iOS 26 Icon Composer + classic PNG sizes)
+cp "$HERE"/assets/AppIconLLC/*.png "$T/Telegram/Telegram-iOS/DefaultAppIcon.xcassets/AppIconLLC.appiconset/"
+ICON="$T/Telegram/Telegram-iOS/Telegram.icon"
+rm -rf "$ICON/Assets" && mkdir -p "$ICON/Assets"
+cp "$HERE/assets/HBolt.png" "$ICON/Assets/HBolt.png"
+cat > "$ICON/icon.json" <<'JSON'
+{
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "image-name" : "HBolt.png",
+          "name" : "HBolt"
+        }
+      ]
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}
+JSON
 # 2) Source patches (features), applied in order
 shopt -s nullglob
 for p in "$HERE"/patches/*.patch; do echo "applying $(basename "$p")"; git -C "$T" apply --whitespace=nowarn "$p"; done

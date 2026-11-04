@@ -1,0 +1,75 @@
+diff --git a/submodules/TelegramUI/Components/PeerSelectionController/Sources/PeerSelectionController.swift b/submodules/TelegramUI/Components/PeerSelectionController/Sources/PeerSelectionController.swift
+index d12e340f4..3881c5540 100644
+--- a/submodules/TelegramUI/Components/PeerSelectionController/Sources/PeerSelectionController.swift
++++ b/submodules/TelegramUI/Components/PeerSelectionController/Sources/PeerSelectionController.swift
+@@ -471,8 +471,14 @@ public final class PeerSelectionControllerImpl: ViewController, PeerSelectionCon
+     @objc private func beginSelection() {
+         self.navigationItem.rightBarButtonItem = nil
+         self.peerSelectionNode.beginSelection()
++        // HBOLT: one tap to tick every group; untick any you don't want before sending.
++        self.navigationItem.rightBarButtonItem = UIBarButtonItem(title: "All groups", style: .plain, target: self, action: #selector(self.hboltSelectAllGroups))
+     }
+     
++    @objc private func hboltSelectAllGroups() {
++        self.peerSelectionNode.hboltSelectAllGroups()
++    }
++
+     @objc func cancelPressed() {
+         if let customDismiss = self.customDismiss {
+             customDismiss()
+diff --git a/submodules/TelegramUI/Components/PeerSelectionController/Sources/PeerSelectionControllerNode.swift b/submodules/TelegramUI/Components/PeerSelectionController/Sources/PeerSelectionControllerNode.swift
+index 0bb396d63..755c52362 100644
+--- a/submodules/TelegramUI/Components/PeerSelectionController/Sources/PeerSelectionControllerNode.swift
++++ b/submodules/TelegramUI/Components/PeerSelectionController/Sources/PeerSelectionControllerNode.swift
+@@ -961,6 +961,51 @@ final class PeerSelectionControllerNode: ASDisplayNode {
+         }
+     }
+ 
++    /// HBOLT: select every group the user is a member of (basic groups + supergroups).
++    func hboltSelectAllGroups() {
++        let _ = (self.context.engine.messages.chatList(group: .root, count: 5000)
++        |> take(1)
++        |> deliverOnMainQueue).startStandalone(next: { [weak self] chatList in
++            guard let self else {
++                return
++            }
++            var groups: [EnginePeer] = []
++            for item in chatList.items {
++                guard let peer = item.renderedPeer.peer else {
++                    continue
++                }
++                switch peer {
++                case .legacyGroup:
++                    groups.append(peer)
++                case let .channel(channel):
++                    if case .group = channel.info {
++                        groups.append(peer)
++                    }
++                default:
++                    break
++                }
++            }
++            if let limit = self.controller?.multipleSelectionLimit, groups.count > Int(limit) {
++                groups = Array(groups.prefix(Int(limit)))
++            }
++            let update: (ChatListNodeState) -> ChatListNodeState = { state in
++                var state = state
++                state.editing = true
++                for peer in groups {
++                    state.selectedPeerIds.insert(peer.id)
++                    state.selectedPeerMap[peer.id] = peer
++                }
++                return state
++            }
++            if let mainContainerNode = self.mainContainerNode {
++                mainContainerNode.currentItemNode.updateState(update)
++            } else if let chatListNode = self.chatListNode {
++                chatListNode.updateState(update)
++            }
++            self.textInputPanelNode?.updateSendButtonEnabled(!groups.isEmpty, animated: true)
++        })
++    }
++
+     func beginSelection() {
+         guard let controller = self.controller else {
+             return
