@@ -19,10 +19,10 @@ index 382555685..2974ad570 100644
          assert(!self.disposed)
          guard let postbox = self.postbox else {
 diff --git a/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift b/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift
-index d2b1024c3..c41ae6835 100644
+index d2b1024c3..dfc989a8f 100644
 --- a/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift
 +++ b/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift
-@@ -23,21 +23,19 @@ public extension HBOLTSettings {
+@@ -23,23 +23,36 @@ public extension HBOLTSettings {
          }
      }
  
@@ -51,3 +51,139 @@ index d2b1024c3..c41ae6835 100644
              }
              return ids
          }
+     }
++
++    /// Every media message (photos, videos, documents, music, voice/round, GIFs) in the chat,
++    /// newest first, max 5000. Plain text messages are ignored.
++    static func allMediaIds(account: Account, peerId: PeerId) -> Signal<[MessageId], NoError> {
++        return account.postbox.transaction { transaction -> [MessageId] in
++            let tags: [MessageTags] = [.photoOrVideo, .file, .music, .voiceOrInstantVideo, .gif]
++            var indices = Set<MessageIndex>()
++            for tag in tags {
++                let found = transaction.hboltLaterIndicesWithTag(peerId: peerId, namespace: Namespaces.Message.Cloud, tag: tag, from: MessageIndex.lowerBound(peerId: peerId, namespace: Namespaces.Message.Cloud), limit: 100000)
++                indices.formUnion(found)
++            }
++            let sorted = indices.sorted(by: { $0 > $1 })
++            return Array(sorted.prefix(5000)).map { $0.id }
++        }
++    }
+ }
+diff --git a/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift b/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
+index 1b3ff63d9..44ba037ce 100644
+--- a/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
++++ b/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
+@@ -695,12 +695,45 @@ private func opportunisticallyTransformOutgoingMedia(network: Network, postbox:
+ }
+ 
+ public func enqueueMessages(account: Account, peerId: PeerId, messages: [EnqueueMessage]) -> Signal<[MessageId?], NoError> {
++    let forwardCount = messages.filter({ if case .forward = $0 { return true } else { return false } }).count
++    if forwardCount > 10 {
++        // HBOLT: bulk forwarding goes out in chunks of 10, 500 ms apart (flood-safe, UI stays responsive).
++        var chunks: [[EnqueueMessage]] = []
++        var index = 0
++        while index < messages.count {
++            chunks.append(Array(messages[index ..< min(index + 10, messages.count)]))
++            index += 10
++        }
++        return hboltEnqueueChunks(account: account, peerId: peerId, chunks: chunks[...], isFirst: true)
++    }
+     return hboltRewriteProtectedForwards(account: account, messages: messages)
+     |> mapToSignal { messages -> Signal<[MessageId?], NoError> in
+         return hboltEnqueueMessagesImpl(account: account, peerId: peerId, messages: messages)
+     }
+ }
+ 
++private func hboltEnqueueChunks(account: Account, peerId: PeerId, chunks: ArraySlice<[EnqueueMessage]>, isFirst: Bool) -> Signal<[MessageId?], NoError> {
++    guard let chunk = chunks.first else {
++        return .single([])
++    }
++    let rest = chunks.dropFirst()
++    let start: Signal<Void, NoError> = isFirst ? .single(Void()) : (.single(Void()) |> delay(0.5, queue: Queue.concurrentDefaultQueue()))
++    return start
++    |> mapToSignal { _ -> Signal<[MessageId?], NoError> in
++        return hboltRewriteProtectedForwards(account: account, messages: chunk)
++        |> mapToSignal { messages -> Signal<[MessageId?], NoError> in
++            return hboltEnqueueMessagesImpl(account: account, peerId: peerId, messages: messages)
++        }
++    }
++    |> take(1)
++    |> mapToSignal { ids -> Signal<[MessageId?], NoError> in
++        return hboltEnqueueChunks(account: account, peerId: peerId, chunks: rest, isFirst: false)
++        |> map { restIds -> [MessageId?] in
++            return ids + restIds
++        }
++    }
++}
++
+ private func hboltEnqueueMessagesImpl(account: Account, peerId: PeerId, messages: [EnqueueMessage]) -> Signal<[MessageId?], NoError> {
+     let signal: Signal<[(Bool, EnqueueMessage)], NoError>
+     if let transformOutgoingMessageMedia = account.transformOutgoingMessageMedia {
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreen.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreen.swift
+index 75bfa955f..7f7afa049 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreen.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreen.swift
+@@ -877,6 +877,21 @@ final class PeerInfoScreenNode: ViewControllerTracingNode, PeerInfoScreenNodePro
+                         })
+                     })))
+                     if HBOLTSettings.bulkSelect {
++                        items.append(.action(ContextMenuActionItem(text: "☑️ Select all media", icon: { theme in generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/SelectAll"), color: theme.contextMenu.primaryColor) }, action: { c, _ in
++                            c?.dismiss(completion: {
++                                guard let strongSelf = self else {
++                                    return
++                                }
++                                let _ = (HBOLTSettings.allMediaIds(account: strongSelf.context.account, peerId: message.id.peerId)
++                                |> deliverOnMainQueue).startStandalone(next: { ids in
++                                    guard let strongSelf = self else {
++                                        return
++                                    }
++                                    strongSelf.chatInterfaceInteraction.toggleMessagesSelection(ids, true)
++                                    strongSelf.expandTabs(animated: true)
++                                })
++                            })
++                        })))
+                         items.append(.action(ContextMenuActionItem(text: "☑️ Select from here to latest (HBOLT)", icon: { theme in generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/SelectAll"), color: theme.contextMenu.primaryColor) }, action: { c, _ in
+                             c?.dismiss(completion: {
+                                 guard let strongSelf = self else {
+@@ -1018,6 +1033,22 @@ final class PeerInfoScreenNode: ViewControllerTracingNode, PeerInfoScreenNodePro
+                             f(.default)
+                         })))
+                         if HBOLTSettings.bulkSelect {
++                            items.append(.action(ContextMenuActionItem(text: "☑️ Select all media", icon: { theme in
++                                return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/SelectAll"), color: theme.actionSheet.primaryTextColor)
++                            }, action: { _, f in
++                                f(.default)
++                                guard let strongSelf = self else {
++                                    return
++                                }
++                                let _ = (HBOLTSettings.allMediaIds(account: strongSelf.context.account, peerId: message.id.peerId)
++                                |> deliverOnMainQueue).startStandalone(next: { ids in
++                                    guard let strongSelf = self else {
++                                        return
++                                    }
++                                    strongSelf.chatInterfaceInteraction.toggleMessagesSelection(ids, true)
++                                    strongSelf.expandTabs(animated: true)
++                                })
++                            })))
+                             items.append(.action(ContextMenuActionItem(text: "☑️ Select from here to latest (HBOLT)", icon: { theme in
+                                 return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/SelectAll"), color: theme.actionSheet.primaryTextColor)
+                             }, action: { _, f in
+diff --git a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+index f1f71a07d..3c22907e3 100644
+--- a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
++++ b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+@@ -2204,6 +2204,15 @@ func contextMenuForChatPresentationInterfaceState(chatPresentationInterfaceState
+             }
+ 
+             if HBOLTSettings.bulkSelect {
++                actions.append(.action(ContextMenuActionItem(text: "☑️ Select all media", icon: { theme in
++                    return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/SelectAll"), color: theme.actionSheet.primaryTextColor)
++                }, action: { _, f in
++                    f(.default)
++                    let _ = (HBOLTSettings.allMediaIds(account: context.account, peerId: message.id.peerId)
++                    |> deliverOnMainQueue).startStandalone(next: { ids in
++                        interfaceInteraction.beginMessageSelection(ids, { _ in })
++                    })
++                })))
+                 actions.append(.action(ContextMenuActionItem(text: "☑️ Select from here to latest (HBOLT)", icon: { theme in
+                     return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/SelectAll"), color: theme.actionSheet.primaryTextColor)
+                 }, action: { _, f in
