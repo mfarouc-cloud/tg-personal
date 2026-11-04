@@ -107,7 +107,7 @@ jobs:
             --configuration=release_arm64 2>&1 | tail -n 400
           find -L bazel-bin/Telegram -maxdepth 1 -name "*.ipa"
 
-      - name: Package HBOLT-Native-Ultimate.ipa (extensions stripped)
+      - name: Package HBOLT-Native-Ultimate-Complete.ipa (extensions stripped)
         run: |
           IPA=$(find -L tgios/bazel-bin/Telegram -maxdepth 1 -name "*.ipa" | head -1); echo "IPA=$IPA"
           test -n "$IPA"
@@ -119,10 +119,10 @@ jobs:
           /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" -c "Print :CFBundleDisplayName" "$APP/Info.plist"
           EXE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist")
           otool -l "$APP/$EXE" | grep -A4 LC_ENCRYPTION_INFO | grep cryptid || echo "no LC_ENCRYPTION_INFO (cryptid 0)"
-          zip -qry ../HBOLT-Native-Ultimate.ipa Payload
-          cd .. && ls -la HBOLT-Native-Ultimate.ipa
+          zip -qry ../HBOLT-Native-Ultimate-Complete.ipa Payload
+          cd .. && ls -la HBOLT-Native-Ultimate-Complete.ipa
       - uses: actions/upload-artifact@v4
         with:
           name: HBOLT-Native-ipa
-          path: HBOLT-Native-Ultimate.ipa
+          path: HBOLT-Native-Ultimate-Complete.ipa
           retention-days: 30

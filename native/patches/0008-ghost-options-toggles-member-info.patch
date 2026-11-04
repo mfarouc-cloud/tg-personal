@@ -1,0 +1,251 @@
+diff --git a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift
+index 9442e9f92..a3007e5ec 100644
+--- a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
++++ b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
+@@ -229,7 +229,8 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+             case .hboltGhostMode:
+                 return 100
+             case let .hboltSwitch(id, _, _):
+-                return 100 + id
++                let order: [Int32: Int32] = [7: 1, 8: 2, 9: 3, 10: 4, 1: 5, 4: 6, 2: 7, 6: 8, 5: 9, 3: 10]
++                return 100 + (order[id] ?? (20 + id))
+         }
+     }
+     
+@@ -458,6 +459,12 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+             case let .hboltSwitch(id, text, value):
+                 return ItemListSwitchItem(presentationData: presentationData, systemStyle: .glass, title: text, value: value, sectionId: self.section, style: .blocks, updated: { value in
+                     switch id {
++                    case 5: HBOLTSettings.setValue("hbolt.linkRecovery", value)
++                    case 6: HBOLTSettings.setValue("hbolt.protectedForward", value)
++                    case 7: HBOLTSettings.setValue("hbolt.ghost.online", value)
++                    case 8: HBOLTSettings.setValue("hbolt.ghost.typing", value)
++                    case 9: HBOLTSettings.setValue("hbolt.ghost.reads", value)
++                    case 10: HBOLTSettings.setValue("hbolt.ghost.stories", value)
+                     case 1: HBOLTSettings.keepDeleted = value
+                     case 2: HBOLTSettings.bypassProtection = value
+                     case 3: HBOLTSettings.hideSponsored = value
+@@ -858,8 +865,14 @@ private func privacyAndSecurityControllerEntries(
+     
+     entries.append(.openLinksIn(presentationData.theme, presentationData.strings.ChatSettings_OpenLinksIn, defaultWebBrowser))
+     entries.append(.hboltGhostMode("👻 Ghost Mode (HBOLT)", HBOLTSettings.ghostMode))
++    entries.append(.hboltSwitch(7, "   ↳ Hide online status", HBOLTSettings.value("hbolt.ghost.online")))
++    entries.append(.hboltSwitch(8, "   ↳ Hide typing…", HBOLTSettings.value("hbolt.ghost.typing")))
++    entries.append(.hboltSwitch(9, "   ↳ No read receipts (incl. Mark all as read)", HBOLTSettings.value("hbolt.ghost.reads")))
++    entries.append(.hboltSwitch(10, "   ↳ Anonymous story viewing", HBOLTSettings.value("hbolt.ghost.stories")))
+     entries.append(.hboltSwitch(1, "🗂 Keep deleted messages (HBOLT)", HBOLTSettings.keepDeleted))
+     entries.append(.hboltSwitch(2, "🔓 Save from protected chats (HBOLT)", HBOLTSettings.bypassProtection))
++    entries.append(.hboltSwitch(6, "↪️ Forward from restricted chats (re-upload)", HBOLTSettings.value("hbolt.protectedForward")))
++    entries.append(.hboltSwitch(5, "🔗 Expired links recovery", HBOLTSettings.value("hbolt.linkRecovery")))
+     entries.append(.hboltSwitch(3, "🚫 Hide sponsored messages (HBOLT)", HBOLTSettings.hideSponsored))
+     entries.append(.hboltSwitch(4, "🕘 Keep edit history (HBOLT)", HBOLTSettings.keepEdits))
+ 
+diff --git a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+index 989900ec1..74c019b93 100644
+--- a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+@@ -97,6 +97,9 @@ private func hboltResend(account: Account, message: Message, threadId: Int64?, g
+ }
+ 
+ func hboltRewriteProtectedForwards(account: Account, messages: [EnqueueMessage]) -> Signal<[EnqueueMessage], NoError> {
++    if !HBOLTSettings.protectedForward {
++        return .single(messages)
++    }
+     let hasProtected = messages.contains(where: { item in
+         if case let .forward(source, _, _, _, _) = item {
+             return HBOLTSettings.isProtected(source.peerId.toInt64())
+diff --git a/submodules/TelegramCore/Sources/HBOLTSettings.swift b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+index f27967e28..1e55d84f5 100644
+--- a/submodules/TelegramCore/Sources/HBOLTSettings.swift
++++ b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+@@ -4,7 +4,7 @@ import Foundation
+ public enum HBOLTSettings {
+     private static let defaults: UserDefaults = {
+         let d = UserDefaults.standard
+-        d.register(defaults: ["hbolt.keepEdits": true, "hbolt.keepDeleted": true, "hbolt.bypassProtection": true, "hbolt.hideSponsored": true])
++        d.register(defaults: ["hbolt.linkRecovery": true, "hbolt.protectedForward": true, "hbolt.ghost.online": true, "hbolt.ghost.typing": true, "hbolt.ghost.reads": true, "hbolt.ghost.stories": true, "hbolt.keepEdits": true, "hbolt.keepDeleted": true, "hbolt.bypassProtection": true, "hbolt.hideSponsored": true])
+         return d
+     }()
+ 
+@@ -20,6 +20,21 @@ public enum HBOLTSettings {
+         set { defaults.set(newValue, forKey: "hbolt.bypassProtection") }
+     }
+ 
++    private static func flag(_ key: String) -> Bool { return defaults.bool(forKey: key) }
++
++    /// Generic switch storage used by the HBOLT settings rows.
++    public static func value(_ key: String) -> Bool { return defaults.bool(forKey: key) }
++    public static func setValue(_ key: String, _ value: Bool) { defaults.set(value, forKey: key) }
++
++    public static var linkRecovery: Bool { return flag("hbolt.linkRecovery") }
++    public static var protectedForward: Bool { return flag("hbolt.protectedForward") }
++
++    // Ghost Mode sub-options (only active while Ghost Mode is on).
++    public static var hideOnline: Bool { return ghostMode && flag("hbolt.ghost.online") }
++    public static var hideTyping: Bool { return ghostMode && flag("hbolt.ghost.typing") }
++    public static var hideReads: Bool { return ghostMode && flag("hbolt.ghost.reads") }
++    public static var hideStoryViews: Bool { return ghostMode && flag("hbolt.ghost.stories") }
++
+     /// Keep the previous text of messages that get edited (viewable from the message menu).
+     public static var keepEdits: Bool {
+         get { return defaults.bool(forKey: "hbolt.keepEdits") }
+diff --git a/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift b/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift
+index b04384da2..6e04c3080 100644
+--- a/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift
+@@ -53,7 +53,7 @@ private final class AccountPresenceManagerImpl {
+             }, queue: self.queue)
+             self.onlineTimer = timer
+             timer.start()
+-            request = self.network.request(Api.functions.account.updateStatus(offline: HBOLTSettings.ghostMode ? .boolTrue : .boolFalse))
++            request = self.network.request(Api.functions.account.updateStatus(offline: HBOLTSettings.hideOnline ? .boolTrue : .boolFalse))
+         } else {
+             self.onlineTimer?.invalidate()
+             self.onlineTimer = nil
+diff --git a/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift b/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift
+index 3aa46fc30..e7d892ba5 100644
+--- a/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift
+@@ -175,7 +175,7 @@ private func requestActivity(postbox: Postbox, network: Network, accountPeerId:
+                 }
+             }
+             
+-            if HBOLTSettings.ghostMode {
++            if HBOLTSettings.hideTyping {
+                 return .complete()
+             }
+             if let inputPeer = apiInputPeer(peer) {
+diff --git a/submodules/TelegramCore/Sources/State/ManagedSynchronizeConsumeMessageContentsOperations.swift b/submodules/TelegramCore/Sources/State/ManagedSynchronizeConsumeMessageContentsOperations.swift
+index 50b066edf..da1e47d03 100644
+--- a/submodules/TelegramCore/Sources/State/ManagedSynchronizeConsumeMessageContentsOperations.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedSynchronizeConsumeMessageContentsOperations.swift
+@@ -110,7 +110,7 @@ func managedSynchronizeConsumeMessageContentOperations(postbox: Postbox, network
+ }
+ 
+ private func synchronizeConsumeMessageContents(transaction: Transaction, network: Network, stateManager: AccountStateManager, peerId: PeerId, operation: SynchronizeConsumeMessageContentsOperation) -> Signal<Void, NoError> {
+-    if HBOLTSettings.ghostMode {
++    if HBOLTSettings.hideReads {
+         return .complete()
+     }
+     if peerId.namespace == Namespaces.Peer.CloudUser || peerId.namespace == Namespaces.Peer.CloudGroup {
+diff --git a/submodules/TelegramCore/Sources/State/ManagedSynchronizeViewStoriesOperations.swift b/submodules/TelegramCore/Sources/State/ManagedSynchronizeViewStoriesOperations.swift
+index 6f07f9f11..7d7478812 100644
+--- a/submodules/TelegramCore/Sources/State/ManagedSynchronizeViewStoriesOperations.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedSynchronizeViewStoriesOperations.swift
+@@ -119,7 +119,7 @@ func managedSynchronizeViewStoriesOperations(postbox: Postbox, network: Network,
+ }
+ 
+ private func pushStoriesAreSeen(postbox: Postbox, network: Network, stateManager: AccountStateManager, peer: Peer, operation: SynchronizeViewStoriesOperation) -> Signal<Void, NoError> {
+-    guard !HBOLTSettings.ghostMode, let inputPeer = apiInputPeer(peer) else {
++    guard !HBOLTSettings.hideStoryViews, let inputPeer = apiInputPeer(peer) else {
+         return .complete()
+     }
+     return network.request(Api.functions.stories.readStories(peer: inputPeer, maxId: operation.storyId))
+diff --git a/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift b/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift
+index 0d440c087..0838395d5 100644
+--- a/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift
++++ b/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift
+@@ -285,7 +285,7 @@ private func pushPeerReadState(network: Network, postbox: Postbox, stateManager:
+                 let (channelId, accessHash) = (inputPeerChannelData.channelId, inputPeerChannelData.accessHash)
+                 switch readState {
+                 case let .idBased(maxIncomingReadId, _, _, _, markedUnread):
+-                    var pushSignal: Signal<Void, NoError> = (HBOLTSettings.ghostMode ? .complete() : network.request(Api.functions.channels.readHistory(channel: Api.InputChannel.inputChannel(.init(channelId: channelId, accessHash: accessHash)), maxId: maxIncomingReadId)))
++                    var pushSignal: Signal<Void, NoError> = (HBOLTSettings.hideReads ? .complete() : network.request(Api.functions.channels.readHistory(channel: Api.InputChannel.inputChannel(.init(channelId: channelId, accessHash: accessHash)), maxId: maxIncomingReadId)))
+                     |> `catch` { _ -> Signal<Api.Bool, NoError> in
+                         return .complete()
+                     }
+@@ -315,7 +315,7 @@ private func pushPeerReadState(network: Network, postbox: Postbox, stateManager:
+             default:
+                 switch readState {
+                 case let .idBased(maxIncomingReadId, _, _, _, markedUnread):
+-                    var pushSignal: Signal<Void, NoError> = (HBOLTSettings.ghostMode ? .complete() : network.request(Api.functions.messages.readHistory(peer: inputPeer, maxId: maxIncomingReadId)))
++                    var pushSignal: Signal<Void, NoError> = (HBOLTSettings.hideReads ? .complete() : network.request(Api.functions.messages.readHistory(peer: inputPeer, maxId: maxIncomingReadId)))
+                     |> map(Optional.init)
+                     |> `catch` { _ -> Signal<Api.messages.AffectedMessages?, NoError> in
+                         return .single(nil)
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Messages/MarkAllChatsAsRead.swift b/submodules/TelegramCore/Sources/TelegramEngine/Messages/MarkAllChatsAsRead.swift
+index 7121900fd..04af71ce5 100644
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Messages/MarkAllChatsAsRead.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Messages/MarkAllChatsAsRead.swift
+@@ -19,7 +19,7 @@ func _internal_markAllChatsAsRead(postbox: Postbox, network: Network, stateManag
+         return postbox.transaction { transaction -> Signal<Void, NoError> in
+             var signals: [Signal<Void, NoError>] = []
+             for peer in result {
+-                if HBOLTSettings.ghostMode {
++                if HBOLTSettings.hideReads {
+                     break
+                 }
+                 switch peer {
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift b/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
+index ccc032f97..bc601873b 100644
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
+@@ -218,7 +218,7 @@ func _internal_joinLinkInformation(_ hash: String, account: Account) -> Signal<E
+             }
+         } else {
+             // HBOLT: expired/revoked link → open the chat this link pointed to before, if we know it.
+-            if let cached = HBOLTSettings.rememberedInvite(hash: hash) {
++            if HBOLTSettings.linkRecovery, let cached = HBOLTSettings.rememberedInvite(hash: hash) {
+                 return account.postbox.transaction({ transaction -> ExternalJoiningChatState in
+                     if let peer = transaction.getPeer(PeerId(cached)) {
+                         return .alreadyJoined(EnginePeer(peer))
+diff --git a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+index 7337b1669..3547070d9 100644
+--- a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
++++ b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+@@ -1347,6 +1347,55 @@ func contextMenuForChatPresentationInterfaceState(chatPresentationInterfaceState
+             }
+         }
+         
++        if let hboltAuthor = message.author {
++            actions.append(.action(ContextMenuActionItem(text: "👤 Member info (HBOLT)", icon: { theme in
++                return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Info"), color: theme.actionSheet.primaryTextColor)
++            }, action: { c, _ in
++                c?.dismiss(completion: {
++                    let presentationData = context.sharedContext.currentPresentationData.with { $0 }
++                    var lines: [String] = []
++                    lines.append("Name: \(hboltAuthor.debugDisplayTitle)")
++                    if let username = hboltAuthor.addressName {
++                        lines.append("Username: @\(username)")
++                    }
++                    lines.append("ID: \(hboltAuthor.id.id._internalGetInt64Value())")
++                    if let user = hboltAuthor as? TelegramUser {
++                        if let phone = user.phone, !phone.isEmpty {
++                            lines.append("Phone: +\(phone)")
++                        }
++                        var tags: [String] = []
++                        if user.botInfo != nil { tags.append("Bot") }
++                        if user.flags.contains(.isPremium) { tags.append("Premium") }
++                        if user.flags.contains(.isVerified) { tags.append("Verified") }
++                        if user.flags.contains(.isScam) { tags.append("Scam") }
++                        if user.flags.contains(.isFake) { tags.append("Fake") }
++                        if user.flags.contains(.mutualContact) { tags.append("Mutual contact") }
++                        if !tags.isEmpty {
++                            lines.append("Tags: " + tags.joined(separator: ", "))
++                        }
++                    } else {
++                        lines.append("Type: channel / group")
++                    }
++                    lines.append("Message ID: \(message.id.id)")
++                    let date = Date(timeIntervalSince1970: Double(message.timestamp))
++                    let formatter = DateFormatter()
++                    formatter.dateStyle = .medium
++                    formatter.timeStyle = .medium
++                    lines.append("Sent: \(formatter.string(from: date))")
++                    let edits = HBOLTSettings.editHistory(peerId: message.id.peerId.toInt64(), messageId: message.id.id)
++                    if !edits.isEmpty {
++                        lines.append("Edits saved: \(edits.count)")
++                    }
++                    let idText = "\(hboltAuthor.id.id._internalGetInt64Value())"
++                    controllerInteraction.presentController(textAlertController(context: context, title: "Member info", text: lines.joined(separator: "\n"), actions: [
++                        TextAlertAction(type: .genericAction, title: "Copy ID", action: {
++                            UIPasteboard.general.string = idText
++                        }),
++                        TextAlertAction(type: .defaultAction, title: presentationData.strings.Common_OK, action: {})
++                    ]), nil)
++                })
++            })))
++        }
+         let hboltEdits = HBOLTSettings.editHistory(peerId: message.id.peerId.toInt64(), messageId: message.id.id)
+         if !hboltEdits.isEmpty {
+             actions.append(.action(ContextMenuActionItem(text: "🕘 Edit history (\(hboltEdits.count))", icon: { theme in
