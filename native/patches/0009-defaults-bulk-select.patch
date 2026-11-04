@@ -1,0 +1,98 @@
+diff --git a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift
+index a3007e5ec..a221221fb 100644
+--- a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
++++ b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
+@@ -229,7 +229,7 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+             case .hboltGhostMode:
+                 return 100
+             case let .hboltSwitch(id, _, _):
+-                let order: [Int32: Int32] = [7: 1, 8: 2, 9: 3, 10: 4, 1: 5, 4: 6, 2: 7, 6: 8, 5: 9, 3: 10]
++                let order: [Int32: Int32] = [7: 1, 8: 2, 9: 3, 10: 4, 1: 5, 4: 6, 2: 7, 11: 8, 6: 9, 5: 10, 3: 11]
+                 return 100 + (order[id] ?? (20 + id))
+         }
+     }
+@@ -460,6 +460,7 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+                 return ItemListSwitchItem(presentationData: presentationData, systemStyle: .glass, title: text, value: value, sectionId: self.section, style: .blocks, updated: { value in
+                     switch id {
+                     case 5: HBOLTSettings.setValue("hbolt.linkRecovery", value)
++                    case 11: HBOLTSettings.setValue("hbolt.bulkSelect", value)
+                     case 6: HBOLTSettings.setValue("hbolt.protectedForward", value)
+                     case 7: HBOLTSettings.setValue("hbolt.ghost.online", value)
+                     case 8: HBOLTSettings.setValue("hbolt.ghost.typing", value)
+@@ -871,7 +872,8 @@ private func privacyAndSecurityControllerEntries(
+     entries.append(.hboltSwitch(10, "   ↳ Anonymous story viewing", HBOLTSettings.value("hbolt.ghost.stories")))
+     entries.append(.hboltSwitch(1, "🗂 Keep deleted messages (HBOLT)", HBOLTSettings.keepDeleted))
+     entries.append(.hboltSwitch(2, "🔓 Save from protected chats (HBOLT)", HBOLTSettings.bypassProtection))
+-    entries.append(.hboltSwitch(6, "↪️ Forward from restricted chats (re-upload)", HBOLTSettings.value("hbolt.protectedForward")))
++    entries.append(.hboltSwitch(11, "☑️ Bulk select & multi-forward", HBOLTSettings.value("hbolt.bulkSelect")))
++    entries.append(.hboltSwitch(6, "↪️ Protected media forward bypass (download + re-upload)", HBOLTSettings.value("hbolt.protectedForward")))
+     entries.append(.hboltSwitch(5, "🔗 Expired links recovery", HBOLTSettings.value("hbolt.linkRecovery")))
+     entries.append(.hboltSwitch(3, "🚫 Hide sponsored messages (HBOLT)", HBOLTSettings.hideSponsored))
+     entries.append(.hboltSwitch(4, "🕘 Keep edit history (HBOLT)", HBOLTSettings.keepEdits))
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift b/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift
+new file mode 100644
+index 000000000..feac61a44
+--- /dev/null
++++ b/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift
+@@ -0,0 +1,25 @@
++import Foundation
++import Postbox
++import SwiftSignalKit
++
++public extension HBOLTSettings {
++    static var bulkSelect: Bool { return value("hbolt.bulkSelect") }
++
++    /// Ids of every locally stored message in the chat from `start` up to the newest one (max 5000).
++    static func messageIdsFromHereToLatest(account: Account, from start: MessageId) -> Signal<[MessageId], NoError> {
++        return account.postbox.transaction { transaction -> [MessageId] in
++            var ids: [MessageId] = []
++            transaction.scanTopMessages(peerId: start.peerId, namespace: start.namespace, limit: 5000, { message in
++                if message.id.id >= start.id {
++                    ids.append(message.id)
++                    return true
++                }
++                return false
++            })
++            if !ids.contains(start) {
++                ids.append(start)
++            }
++            return ids
++        }
++    }
++}
+diff --git a/submodules/TelegramCore/Sources/HBOLTSettings.swift b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+index 1e55d84f5..46eba05f0 100644
+--- a/submodules/TelegramCore/Sources/HBOLTSettings.swift
++++ b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+@@ -4,7 +4,7 @@ import Foundation
+ public enum HBOLTSettings {
+     private static let defaults: UserDefaults = {
+         let d = UserDefaults.standard
+-        d.register(defaults: ["hbolt.linkRecovery": true, "hbolt.protectedForward": true, "hbolt.ghost.online": true, "hbolt.ghost.typing": true, "hbolt.ghost.reads": true, "hbolt.ghost.stories": true, "hbolt.keepEdits": true, "hbolt.keepDeleted": true, "hbolt.bypassProtection": true, "hbolt.hideSponsored": true])
++        d.register(defaults: ["hbolt.ghostMode": true, "hbolt.bulkSelect": true, "hbolt.linkRecovery": true, "hbolt.protectedForward": true, "hbolt.ghost.online": true, "hbolt.ghost.typing": true, "hbolt.ghost.reads": true, "hbolt.ghost.stories": true, "hbolt.keepEdits": true, "hbolt.keepDeleted": true, "hbolt.bypassProtection": true, "hbolt.hideSponsored": true])
+         return d
+     }()
+ 
+diff --git a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+index 3547070d9..2001c3adf 100644
+--- a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
++++ b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+@@ -2203,6 +2203,18 @@ func contextMenuForChatPresentationInterfaceState(chatPresentationInterfaceState
+                 })))
+             }
+ 
++            if HBOLTSettings.bulkSelect {
++                actions.append(.action(ContextMenuActionItem(text: "☑️ Select from here to latest (HBOLT)", icon: { theme in
++                    return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/SelectAll"), color: theme.actionSheet.primaryTextColor)
++                }, action: { _, f in
++                    f(.default)
++                    let _ = (HBOLTSettings.messageIdsFromHereToLatest(account: context.account, from: message.id)
++                    |> deliverOnMainQueue).startStandalone(next: { ids in
++                        interfaceInteraction.beginMessageSelection(ids, { _ in })
++                    })
++                })))
++            }
++
+             if messages.count > 1 {
+                 if !actions.isEmpty && !didAddSeparator {
+                     didAddSeparator = true
