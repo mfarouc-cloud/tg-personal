@@ -1,0 +1,23 @@
+diff --git a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+index 3c22907e3..e864340eb 100644
+--- a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
++++ b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+@@ -1347,6 +1347,18 @@ func contextMenuForChatPresentationInterfaceState(chatPresentationInterfaceState
+             }
+         }
+         
++        if message.id.peerId != context.account.peerId && message.id.namespace == Namespaces.Message.Cloud {
++            let hboltSaveIds = messages.map { $0.id }
++            actions.append(.action(ContextMenuActionItem(text: "📥 Save to Saved Messages", icon: { theme in
++                return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Fave"), color: theme.actionSheet.primaryTextColor)
++            }, action: { _, f in
++                f(.default)
++                let enqueue: [EnqueueMessage] = hboltSaveIds.map { id in
++                    return .forward(source: id, threadId: nil, grouping: .auto, attributes: [], correlationId: nil)
++                }
++                let _ = enqueueMessages(account: context.account, peerId: context.account.peerId, messages: enqueue).startStandalone()
++            })))
++        }
+         if let hboltAuthor = message.author {
+             actions.append(.action(ContextMenuActionItem(text: "👤 Member info (HBOLT)", icon: { theme in
+                 return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Info"), color: theme.actionSheet.primaryTextColor)
