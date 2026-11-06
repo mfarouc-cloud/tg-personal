@@ -1,0 +1,59 @@
+diff --git a/submodules/TelegramUI/Sources/ChatController.swift b/submodules/TelegramUI/Sources/ChatController.swift
+index a7f2cea0c..665cdd4f8 100644
+--- a/submodules/TelegramUI/Sources/ChatController.swift
++++ b/submodules/TelegramUI/Sources/ChatController.swift
+@@ -7075,7 +7075,43 @@ public final class ChatControllerImpl: TelegramBaseController, ChatController, G
+         })
+     }
+ 
++    private var hboltForwardProgressController: UndoOverlayController?
++    private var hboltForwardProgressDisposable: Disposable?
++
++    // HBOLT: window-level "Forwarding N…" counter driven by the real unsent-message queue.
++    // Shown for bulk sends/forwards into this chat; floats over whatever screen is open and
++    // ticks down as Telegram's send queue drains, then dismisses.
++    private func hboltShowForwardProgress(peerId: PeerId, total: Int) {
++        self.hboltForwardProgressDisposable?.dispose()
++        let makeContent: (Int) -> UndoOverlayContent = { remaining in
++            return .info(title: nil, text: "Forwarding \(remaining)…", timeout: nil, customUndoText: nil)
++        }
++        if let existing = self.hboltForwardProgressController {
++            existing.content = makeContent(total)
++        } else {
++            let controller = UndoOverlayController(presentationData: self.presentationData, content: makeContent(total), elevatedLayout: false, position: .top, action: { _ in return false })
++            self.hboltForwardProgressController = controller
++            self.present(controller, in: .window(.root))
++        }
++        self.hboltForwardProgressDisposable = (self.context.account.postbox.unsentMessageIdsView()
++        |> deliverOnMainQueue).startStrict(next: { [weak self] view in
++            guard let self else {
++                return
++            }
++            let remaining = view.ids.filter({ $0.peerId == peerId }).count
++            if remaining <= 0 {
++                self.hboltForwardProgressController?.dismiss()
++                self.hboltForwardProgressController = nil
++                self.hboltForwardProgressDisposable?.dispose()
++                self.hboltForwardProgressDisposable = nil
++            } else {
++                self.hboltForwardProgressController?.content = makeContent(remaining)
++            }
++        })
++    }
++
+     deinit {
++        self.hboltForwardProgressDisposable?.dispose()
+         let _ = ChatControllerCount.modify { value in
+             return value - 1
+         }
+@@ -9177,6 +9213,10 @@ public final class ChatControllerImpl: TelegramBaseController, ChatController, G
+             if commit || !isScheduledMessages {
+                 self.commitPurposefulAction()
+                 
++                if messages.count >= 10 {
++                    self.hboltShowForwardProgress(peerId: peerId, total: messages.count)
++                }
++                
+                 let _ = (enqueueMessages(account: self.context.account, peerId: peerId, messages: self.transformEnqueueMessages(messages, postpone: postpone))
+                 |> deliverOnMainQueue).startStandalone(next: { [weak self] _ in
+                     if let strongSelf = self, strongSelf.presentationInterfaceState.subject != .scheduledMessages {
