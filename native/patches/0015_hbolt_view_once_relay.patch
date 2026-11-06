@@ -1,0 +1,115 @@
+diff --git a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift
+index 6e9083716..0b8ce5349 100644
+--- a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
++++ b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
+@@ -229,7 +229,7 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+             case .hboltGhostMode:
+                 return 100
+             case let .hboltSwitch(id, _, _):
+-                let order: [Int32: Int32] = [7: 1, 8: 2, 9: 3, 10: 4, 1: 5, 4: 6, 2: 7, 11: 8, 6: 9, 5: 10, 3: 11, 12: 12]
++                let order: [Int32: Int32] = [7: 1, 8: 2, 9: 3, 10: 4, 1: 5, 4: 6, 2: 7, 11: 8, 13: 9, 6: 10, 5: 11, 3: 12, 12: 13]
+                 return 100 + (order[id] ?? (20 + id))
+         }
+     }
+@@ -461,6 +461,7 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+                     switch id {
+                     case 5: HBOLTSettings.setValue("hbolt.linkRecovery", value)
+                     case 11: HBOLTSettings.setValue("hbolt.bulkSelect", value)
++                    case 13: HBOLTSettings.setValue("hbolt.viewOnceToPrivate", value)
+                     case 12:
+                         HBOLTSettings.setValue("hbolt.keepLogin", value)
+                         if !value {
+@@ -879,6 +880,7 @@ private func privacyAndSecurityControllerEntries(
+     entries.append(.hboltSwitch(2, "🔓 Save from protected chats (HBOLT)", HBOLTSettings.bypassProtection))
+     entries.append(.hboltSwitch(11, "☑️ Bulk select & multi-forward", HBOLTSettings.value("hbolt.bulkSelect")))
+     entries.append(.hboltSwitch(6, "↪️ Protected media forward bypass (download + re-upload)", HBOLTSettings.value("hbolt.protectedForward")))
++    entries.append(.hboltSwitch(13, "📸 Forward single media to private chats as View Once", HBOLTSettings.value("hbolt.viewOnceToPrivate")))
+     entries.append(.hboltSwitch(5, "🔗 Expired links recovery", HBOLTSettings.value("hbolt.linkRecovery")))
+     entries.append(.hboltSwitch(3, "🚫 Hide sponsored messages (HBOLT)", HBOLTSettings.hideSponsored))
+     entries.append(.hboltSwitch(12, "🔐 Keep login after reinstall (this device only)", HBOLTSettings.value("hbolt.keepLogin")))
+diff --git a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+index 66085b5fe..f8ded81db 100644
+--- a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+@@ -62,11 +62,14 @@ private func hboltCopyResource(account: Account, message: Message, media: Media,
+ }
+ 
+ /// Turns `.forward` of protected content into `.message` with re-uploaded copies.
+-private func hboltResend(account: Account, message: Message, threadId: Int64?, grouping: EnqueueMessageGrouping, attributes: [MessageAttribute], correlationId: Int64?, groupingKeys: [Int64: Int64]) -> Signal<EnqueueMessage, NoError> {
+-    var copiedAttributes: [MessageAttribute] = attributes.filter { !($0 is TextEntitiesMessageAttribute) }
++private func hboltResend(account: Account, message: Message, threadId: Int64?, grouping: EnqueueMessageGrouping, attributes: [MessageAttribute], correlationId: Int64?, groupingKeys: [Int64: Int64], viewOnce: Bool = false) -> Signal<EnqueueMessage, NoError> {
++    var copiedAttributes: [MessageAttribute] = attributes.filter { !($0 is TextEntitiesMessageAttribute) && !($0 is AutoremoveTimeoutMessageAttribute) }
+     if let entities = message.attributes.first(where: { $0 is TextEntitiesMessageAttribute }) {
+         copiedAttributes.append(entities)
+     }
++    if viewOnce {
++        copiedAttributes.append(AutoremoveTimeoutMessageAttribute(timeout: viewOnceTimeout, countdownBeginTime: nil))
++    }
+     var localGroupingKey: Int64?
+     if case .auto = grouping, let key = message.groupingKey {
+         localGroupingKey = groupingKeys[key]
+@@ -135,3 +138,46 @@ func hboltRewriteProtectedForwards(account: Account, messages: [EnqueueMessage])
+         return combineLatest(signals)
+     }
+ }
++
++
++public extension HBOLTSettings {
++    /// When forwarding a single photo/video into a private chat, re-upload it as view-once.
++    static var viewOnceToPrivate: Bool { return value("hbolt.viewOnceToPrivate") }
++}
++
++/// HBOLT: for a private (user) target, rewrite single-photo/single-video forwards into
++/// re-uploaded view-once messages. Everything else passes through unchanged.
++func hboltRewriteViewOnce(account: Account, peerId: PeerId, messages: [EnqueueMessage]) -> Signal<[EnqueueMessage], NoError> {
++    guard HBOLTSettings.viewOnceToPrivate, peerId.namespace == Namespaces.Peer.CloudUser else {
++        return .single(messages)
++    }
++    let hasForward = messages.contains(where: { if case .forward = $0 { return true } else { return false } })
++    if !hasForward {
++        return .single(messages)
++    }
++    return account.postbox.transaction { transaction -> [Message?] in
++        return messages.map { item -> Message? in
++            if case let .forward(source, _, _, _, _) = item {
++                return transaction.getMessage(source)
++            }
++            return nil
++        }
++    }
++    |> mapToSignal { sources -> Signal<[EnqueueMessage], NoError> in
++        var signals: [Signal<EnqueueMessage, NoError>] = []
++        for (index, item) in messages.enumerated() {
++            if case let .forward(_, threadId, _, attributes, correlationId) = item, let source = sources[index], hboltIsSingleVisualMedia(source) {
++                signals.append(hboltResend(account: account, message: source, threadId: threadId, grouping: .none, attributes: attributes, correlationId: correlationId, groupingKeys: [:], viewOnce: true))
++            } else {
++                signals.append(.single(item))
++            }
++        }
++        return combineLatest(signals)
++    }
++}
++
++private func hboltIsSingleVisualMedia(_ message: Message) -> Bool {
++    let visual = message.media.filter { ($0 is TelegramMediaImage) || (($0 as? TelegramMediaFile)?.isVideo ?? false) }
++    let others = message.media.filter { !($0 is TelegramMediaImage) && !($0 is TelegramMediaFile) }
++    return visual.count == 1 && others.isEmpty && message.groupingKey == nil
++}
+diff --git a/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift b/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
+index 44ba037ce..3391e06a6 100644
+--- a/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
++++ b/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
+@@ -695,6 +695,13 @@ private func opportunisticallyTransformOutgoingMedia(network: Network, postbox:
+ }
+ 
+ public func enqueueMessages(account: Account, peerId: PeerId, messages: [EnqueueMessage]) -> Signal<[MessageId?], NoError> {
++    return hboltRewriteViewOnce(account: account, peerId: peerId, messages: messages)
++    |> mapToSignal { messages -> Signal<[MessageId?], NoError> in
++        return hboltEnqueueAfterViewOnce(account: account, peerId: peerId, messages: messages)
++    }
++}
++
++private func hboltEnqueueAfterViewOnce(account: Account, peerId: PeerId, messages: [EnqueueMessage]) -> Signal<[MessageId?], NoError> {
+     let forwardCount = messages.filter({ if case .forward = $0 { return true } else { return false } }).count
+     if forwardCount > 10 {
+         // HBOLT: bulk forwarding goes out in chunks of 10, 500 ms apart (flood-safe, UI stays responsive).
