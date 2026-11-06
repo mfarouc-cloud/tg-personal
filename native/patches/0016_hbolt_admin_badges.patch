@@ -1,0 +1,83 @@
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/Panes/PeerInfoGroupsInCommonPaneNode.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/Panes/PeerInfoGroupsInCommonPaneNode.swift
+index cb27d285c..c508497f5 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/Panes/PeerInfoGroupsInCommonPaneNode.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/Panes/PeerInfoGroupsInCommonPaneNode.swift
+@@ -25,13 +25,14 @@ private struct GroupsInCommonListTransaction {
+ private struct GroupsInCommonListEntry: Comparable, Identifiable {
+     var index: Int
+     var peer: EnginePeer
++    var hboltRank: String?
+ 
+     var stableId: EnginePeer.Id {
+         return self.peer.id
+     }
+ 
+     static func ==(lhs: GroupsInCommonListEntry, rhs: GroupsInCommonListEntry) -> Bool {
+-        return lhs.peer == rhs.peer
++        return lhs.peer == rhs.peer && lhs.hboltRank == rhs.hboltRank
+     }
+     
+     static func <(lhs: GroupsInCommonListEntry, rhs: GroupsInCommonListEntry) -> Bool {
+@@ -40,7 +41,8 @@ private struct GroupsInCommonListEntry: Comparable, Identifiable {
+     
+     func item(context: AccountContext, presentationData: PresentationData, openPeer: @escaping (EnginePeer) -> Void, openPeerContextAction: @escaping (EnginePeer, ASDisplayNode, ContextGesture?) -> Void) -> ListViewItem {
+         let peer = self.peer
+-        return ItemListPeerItem(presentationData: ItemListPresentationData(presentationData), dateTimeFormat: presentationData.dateTimeFormat, nameDisplayOrder: presentationData.nameDisplayOrder, context: context, peer: self.peer, presence: nil, text: .none, label: .none, editing: ItemListPeerItemEditing(editable: false, editing: false, revealed: false), switchValue: nil, enabled: true, selectable: true, sectionId: 0, action: {
++        let hboltLabel: ItemListPeerItemLabel = self.hboltRank.flatMap { $0.isEmpty ? nil : ItemListPeerItemLabel.text($0, .standard, presentationData.theme.list.itemAccentColor, false) } ?? .none
++        return ItemListPeerItem(presentationData: ItemListPresentationData(presentationData), dateTimeFormat: presentationData.dateTimeFormat, nameDisplayOrder: presentationData.nameDisplayOrder, context: context, peer: self.peer, presence: nil, text: .none, label: hboltLabel, editing: ItemListPeerItemEditing(editable: false, editing: false, revealed: false), switchValue: nil, enabled: true, selectable: true, sectionId: 0, action: {
+             openPeer(peer)
+         }, setPeerIdWithRevealedOptions: { _, _ in
+         }, removePeer: { _ in
+@@ -104,6 +106,9 @@ final class PeerInfoGroupsInCommonPaneNode: ASDisplayNode, PeerInfoPaneNode {
+     }
+         
+     private var disposable: Disposable?
++    private var hboltRanks: [EnginePeer.Id: String] = [:]
++    private var hboltRankStarted = Set<EnginePeer.Id>()
++    private let hboltRankDisposables = DisposableSet()
+     
+     init(context: AccountContext, peerId: EnginePeer.Id, chatControllerInteraction: ChatControllerInteraction, openPeerContextAction: @escaping (Bool, EnginePeer, ASDisplayNode, ContextGesture?) -> Void, groupsInCommonContext: GroupsInCommonContext) {
+         self.context = context
+@@ -177,6 +182,7 @@ final class PeerInfoGroupsInCommonPaneNode: ASDisplayNode, PeerInfoPaneNode {
+     
+     deinit {
+         self.disposable?.dispose()
++        self.hboltRankDisposables.dispose()
+     }
+     
+     func ensureMessageIsVisible(id: EngineMessage.Id) {    
+@@ -228,7 +234,33 @@ final class PeerInfoGroupsInCommonPaneNode: ASDisplayNode, PeerInfoPaneNode {
+         var entries: [GroupsInCommonListEntry] = []
+         for peer in state.peers {
+             if let peer = peer.peer {
+-                entries.append(GroupsInCommonListEntry(index: entries.count, peer: EnginePeer(peer)))
++                entries.append(GroupsInCommonListEntry(index: entries.count, peer: EnginePeer(peer), hboltRank: self.hboltRanks[peer.id]))
++                // HBOLT: resolve the viewed user's Owner/Admin status in each shared supergroup/channel (once).
++                if peer.id.namespace == Namespaces.Peer.CloudChannel && !self.hboltRankStarted.contains(peer.id) {
++                    self.hboltRankStarted.insert(peer.id)
++                    let groupId = peer.id
++                    self.hboltRankDisposables.add((self.context.engine.peers.fetchChannelParticipant(peerId: groupId, participantId: self.peerId)
++                    |> deliverOnMainQueue).startStrict(next: { [weak self] participant in
++                        guard let self else {
++                            return
++                        }
++                        var label: String?
++                        switch participant {
++                        case .creator:
++                            label = "Owner"
++                        case let .member(_, _, adminInfo, _, _, _):
++                            if adminInfo != nil {
++                                label = "Admin"
++                            }
++                        case .none:
++                            break
++                        }
++                        self.hboltRanks[groupId] = label ?? ""
++                        if let state = self.state, let presentationData = self.currentParams?.presentationData {
++                            self.updatePeers(state: state, presentationData: presentationData)
++                        }
++                    }))
++                }
+             }
+         }
+         let transaction = preparedTransition(from: self.currentEntries, to: entries, context: self.context, presentationData: presentationData, openPeer: { [weak self] peer in
