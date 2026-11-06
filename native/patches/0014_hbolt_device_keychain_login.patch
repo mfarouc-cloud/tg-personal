@@ -1,0 +1,166 @@
+diff --git a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift
+index a221221fb..6e9083716 100644
+--- a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
++++ b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
+@@ -229,7 +229,7 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+             case .hboltGhostMode:
+                 return 100
+             case let .hboltSwitch(id, _, _):
+-                let order: [Int32: Int32] = [7: 1, 8: 2, 9: 3, 10: 4, 1: 5, 4: 6, 2: 7, 11: 8, 6: 9, 5: 10, 3: 11]
++                let order: [Int32: Int32] = [7: 1, 8: 2, 9: 3, 10: 4, 1: 5, 4: 6, 2: 7, 11: 8, 6: 9, 5: 10, 3: 11, 12: 12]
+                 return 100 + (order[id] ?? (20 + id))
+         }
+     }
+@@ -461,6 +461,11 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+                     switch id {
+                     case 5: HBOLTSettings.setValue("hbolt.linkRecovery", value)
+                     case 11: HBOLTSettings.setValue("hbolt.bulkSelect", value)
++                    case 12:
++                        HBOLTSettings.setValue("hbolt.keepLogin", value)
++                        if !value {
++                            HBOLTSessionKeychain.clear()
++                        }
+                     case 6: HBOLTSettings.setValue("hbolt.protectedForward", value)
+                     case 7: HBOLTSettings.setValue("hbolt.ghost.online", value)
+                     case 8: HBOLTSettings.setValue("hbolt.ghost.typing", value)
+@@ -876,6 +881,7 @@ private func privacyAndSecurityControllerEntries(
+     entries.append(.hboltSwitch(6, "↪️ Protected media forward bypass (download + re-upload)", HBOLTSettings.value("hbolt.protectedForward")))
+     entries.append(.hboltSwitch(5, "🔗 Expired links recovery", HBOLTSettings.value("hbolt.linkRecovery")))
+     entries.append(.hboltSwitch(3, "🚫 Hide sponsored messages (HBOLT)", HBOLTSettings.hideSponsored))
++    entries.append(.hboltSwitch(12, "🔐 Keep login after reinstall (this device only)", HBOLTSettings.value("hbolt.keepLogin")))
+     entries.append(.hboltSwitch(4, "🕘 Keep edit history (HBOLT)", HBOLTSettings.keepEdits))
+ 
+     return entries
+diff --git a/submodules/TelegramCore/Sources/HBOLTSessionKeychain.swift b/submodules/TelegramCore/Sources/HBOLTSessionKeychain.swift
+new file mode 100644
+index 000000000..78427e073
+--- /dev/null
++++ b/submodules/TelegramCore/Sources/HBOLTSessionKeychain.swift
+@@ -0,0 +1,64 @@
++import Foundation
++import Security
++
++/// HBOLT: keeps each logged-in account's AccountBackupData (user id, master DC, DC auth keys)
++/// in the iOS Keychain, bound to THIS device only (never synced to iCloud), so a reinstall
++/// can rebuild the accounts without a new login code. Telegram itself rebuilds an account
++/// from AccountBackupData when its database is empty.
++public enum HBOLTSessionKeychain {
++    private static let service = "hbolt.sessions"
++    private static let account = "accounts"
++
++    public static var enabled: Bool {
++        return HBOLTSettings.value("hbolt.keepLogin")
++    }
++
++    private static var baseQuery: [String: Any] {
++        return [
++            kSecClass as String: kSecClassGenericPassword,
++            kSecAttrService as String: service,
++            kSecAttrAccount as String: account,
++            kSecAttrSynchronizable as String: kCFBooleanFalse as Any
++        ]
++    }
++
++    public static func save(_ backups: [AccountBackupData]) {
++        if !enabled || backups.isEmpty {
++            clear()
++            return
++        }
++        guard let data = try? JSONEncoder().encode(backups) else {
++            return
++        }
++        if let existing = loadData(), existing == data {
++            return
++        }
++        SecItemDelete(baseQuery as CFDictionary)
++        var query = baseQuery
++        query[kSecValueData as String] = data
++        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
++        SecItemAdd(query as CFDictionary, nil)
++    }
++
++    public static func load() -> [AccountBackupData] {
++        guard enabled, let data = loadData() else {
++            return []
++        }
++        return (try? JSONDecoder().decode([AccountBackupData].self, from: data)) ?? []
++    }
++
++    public static func clear() {
++        SecItemDelete(baseQuery as CFDictionary)
++    }
++
++    private static func loadData() -> Data? {
++        var query = baseQuery
++        query[kSecReturnData as String] = true
++        query[kSecMatchLimit as String] = kSecMatchLimitOne
++        var result: AnyObject?
++        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else {
++            return nil
++        }
++        return result as? Data
++    }
++}
+diff --git a/submodules/TelegramCore/Sources/HBOLTSettings.swift b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+index 46eba05f0..2b3e8a943 100644
+--- a/submodules/TelegramCore/Sources/HBOLTSettings.swift
++++ b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+@@ -4,7 +4,7 @@ import Foundation
+ public enum HBOLTSettings {
+     private static let defaults: UserDefaults = {
+         let d = UserDefaults.standard
+-        d.register(defaults: ["hbolt.ghostMode": true, "hbolt.bulkSelect": true, "hbolt.linkRecovery": true, "hbolt.protectedForward": true, "hbolt.ghost.online": true, "hbolt.ghost.typing": true, "hbolt.ghost.reads": true, "hbolt.ghost.stories": true, "hbolt.keepEdits": true, "hbolt.keepDeleted": true, "hbolt.bypassProtection": true, "hbolt.hideSponsored": true])
++        d.register(defaults: ["hbolt.keepLogin": true, "hbolt.ghostMode": true, "hbolt.bulkSelect": true, "hbolt.linkRecovery": true, "hbolt.protectedForward": true, "hbolt.ghost.online": true, "hbolt.ghost.typing": true, "hbolt.ghost.reads": true, "hbolt.ghost.stories": true, "hbolt.keepEdits": true, "hbolt.keepDeleted": true, "hbolt.bypassProtection": true, "hbolt.hideSponsored": true])
+         return d
+     }()
+ 
+diff --git a/submodules/TelegramUI/Sources/AppDelegate.swift b/submodules/TelegramUI/Sources/AppDelegate.swift
+index 82fed61d0..f4a6c3572 100644
+--- a/submodules/TelegramUI/Sources/AppDelegate.swift
++++ b/submodules/TelegramUI/Sources/AppDelegate.swift
+@@ -1066,6 +1066,29 @@ private func extractAccountManagerState(records: AccountRecordsView<TelegramAcco
+         telegramUIDeclareEncodables()
+         initializeAccountManagement()
+ 
++        // HBOLT: after a reinstall the account list is empty — rebuild accounts from the device Keychain backup.
++        let hboltRestored = HBOLTSessionKeychain.load()
++        if !hboltRestored.isEmpty {
++            let _ = accountManager.transaction({ transaction -> Void in
++                if !transaction.getRecords().isEmpty {
++                    return
++                }
++                var firstId: AccountRecordId?
++                for (index, backup) in hboltRestored.enumerated() {
++                    let id = transaction.createRecord([
++                        .backupData(AccountBackupDataAttribute(data: backup)),
++                        .sortOrder(AccountSortOrderAttribute(order: Int32(index)))
++                    ])
++                    if firstId == nil {
++                        firstId = id
++                    }
++                }
++                if let firstId = firstId {
++                    transaction.setCurrentId(firstId)
++                }
++            }).startStandalone()
++        }
++
+         if isUITest,
+            let deleteIdx = CommandLine.arguments.firstIndex(of: "--delete-test-account"),
+            deleteIdx + 1 < CommandLine.arguments.count
+diff --git a/submodules/TelegramUI/Sources/SharedAccountContext.swift b/submodules/TelegramUI/Sources/SharedAccountContext.swift
+index 478b8afa9..0705f35ba 100644
+--- a/submodules/TelegramUI/Sources/SharedAccountContext.swift
++++ b/submodules/TelegramUI/Sources/SharedAccountContext.swift
+@@ -623,6 +623,11 @@ public final class SharedAccountContextImpl: SharedAccountContext {
+                 }
+                 result[record.id] = AccountAttributes(sortIndex: sortIndex, isTestingEnvironment: isTestingEnvironment, backupData: backupData, isSupportUser: isSupportUser)
+             }
++            // HBOLT: mirror the logged-in accounts' backup data into the device-only Keychain.
++            let hboltBackups = result.values.sorted(by: { $0.sortIndex < $1.sortIndex }).compactMap { $0.backupData }
++            if !view.records.isEmpty {
++                HBOLTSessionKeychain.save(hboltBackups)
++            }
+             let authRecord: (AccountRecordId, Bool)? = view.currentAuthAccount.flatMap({ authAccount in
+                 let isTestingEnvironment = authAccount.attributes.contains(where: { attribute in
+                     if case let .environment(environment) = attribute, case .test = environment.environment {
