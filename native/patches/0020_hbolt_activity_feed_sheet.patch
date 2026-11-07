@@ -1,0 +1,211 @@
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/HBOLTActivityFeed.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/HBOLTActivityFeed.swift
+new file mode 100644
+index 000000000..38d7107f5
+--- /dev/null
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/HBOLTActivityFeed.swift
+@@ -0,0 +1,184 @@
++import Foundation
++import UIKit
++import Display
++import SwiftSignalKit
++import Postbox
++import TelegramCore
++import TelegramPresentationData
++import ItemListUI
++import PresentationDataUtils
++import AccountContext
++
++// HBOLT: aggregated "recent activity" of one user across the groups you share with them.
++// Runs concurrent native member-filtered searchMessages queries, merges and sorts by date.
++// Scoped strictly to shared groups (messages already visible to you) — no cross-Telegram indexing.
++
++private struct HBOLTActivityRow: Equatable {
++    let peerId: PeerId
++    let messageId: MessageId
++    let groupTitle: String
++    let text: String
++    let timestamp: Int32
++}
++
++private struct HBOLTActivityData: Equatable {
++    var loading: Bool
++    var rows: [HBOLTActivityRow]
++}
++
++private final class HBOLTActivityArguments {
++    let openGroup: (PeerId) -> Void
++    init(openGroup: @escaping (PeerId) -> Void) {
++        self.openGroup = openGroup
++    }
++}
++
++private enum HBOLTActivityEntry: ItemListNodeEntry {
++    case status(String)
++    case row(index: Int, peerId: PeerId, messageId: MessageId, title: String)
++
++    var section: ItemListSectionId {
++        return 0
++    }
++
++    var stableId: Int {
++        switch self {
++        case .status:
++            return -1
++        case let .row(index, _, _, _):
++            return index
++        }
++    }
++
++    static func ==(lhs: HBOLTActivityEntry, rhs: HBOLTActivityEntry) -> Bool {
++        switch lhs {
++        case let .status(text):
++            if case .status(text) = rhs { return true } else { return false }
++        case let .row(index, peerId, messageId, title):
++            if case let .row(rIndex, rPeerId, rMessageId, rTitle) = rhs, index == rIndex, peerId == rPeerId, messageId == rMessageId, title == rTitle {
++                return true
++            } else {
++                return false
++            }
++        }
++    }
++
++    static func <(lhs: HBOLTActivityEntry, rhs: HBOLTActivityEntry) -> Bool {
++        return lhs.stableId < rhs.stableId
++    }
++
++    func item(presentationData: ItemListPresentationData, arguments: Any) -> ListViewItem {
++        let arguments = arguments as! HBOLTActivityArguments
++        switch self {
++        case let .status(text):
++            return ItemListTextItem(presentationData: presentationData, text: .plain(text), sectionId: self.section)
++        case let .row(_, peerId, _, title):
++            return ItemListActionItem(presentationData: presentationData, title: title, kind: .generic, alignment: .natural, sectionId: self.section, style: .blocks, action: {
++                arguments.openGroup(peerId)
++            })
++        }
++    }
++}
++
++func hboltActivityFeedController(context: AccountContext, targetPeerId: PeerId, groupsInCommon: GroupsInCommonContext) -> ViewController {
++    var openGroupImpl: ((PeerId) -> Void)?
++
++    let arguments = HBOLTActivityArguments(openGroup: { peerId in
++        openGroupImpl?(peerId)
++    })
++
++    let dataSignal: Signal<HBOLTActivityData, NoError> = groupsInCommon.state
++    |> take(1)
++    |> mapToSignal { commonState -> Signal<HBOLTActivityData, NoError> in
++        let groups: [(PeerId, String)] = commonState.peers.compactMap { rendered in
++            guard let peer = rendered.peer else {
++                return nil
++            }
++            return (peer.id, peer.debugDisplayTitle)
++        }
++        if groups.isEmpty {
++            return .single(HBOLTActivityData(loading: false, rows: []))
++        }
++        let queries: [Signal<[HBOLTActivityRow], NoError>] = groups.map { group in
++            let (groupId, groupTitle) = group
++            return context.engine.messages.searchMessages(location: .peer(peerId: groupId, fromId: targetPeerId, tags: nil, reactions: nil, threadId: nil, minDate: nil, maxDate: nil), query: "", state: nil)
++            |> map { result, _ -> [HBOLTActivityRow] in
++                return result.messages.map { message in
++                    var snippet = message.text
++                    if snippet.isEmpty {
++                        if message.media.contains(where: { $0 is TelegramMediaImage }) {
++                            snippet = "🖼 Photo"
++                        } else if message.media.contains(where: { ($0 as? TelegramMediaFile)?.isVideo ?? false }) {
++                            snippet = "🎬 Video"
++                        } else if !message.media.isEmpty {
++                            snippet = "📎 Media"
++                        } else {
++                            snippet = "…"
++                        }
++                    }
++                    if snippet.count > 80 {
++                        snippet = String(snippet.prefix(80)) + "…"
++                    }
++                    return HBOLTActivityRow(peerId: groupId, messageId: message.id, groupTitle: groupTitle, text: snippet, timestamp: message.timestamp)
++                }
++            }
++            |> `catch` { _ -> Signal<[HBOLTActivityRow], NoError> in
++                return .single([])
++            }
++        }
++        return combineLatest(queries)
++        |> map { lists -> HBOLTActivityData in
++            var all: [HBOLTActivityRow] = []
++            for list in lists {
++                all.append(contentsOf: list)
++            }
++            all.sort(by: { $0.timestamp > $1.timestamp })
++            return HBOLTActivityData(loading: false, rows: Array(all.prefix(80)))
++        }
++    }
++
++    let withLoading: Signal<HBOLTActivityData, NoError> = .single(HBOLTActivityData(loading: true, rows: []))
++    |> then(dataSignal)
++
++    let presentationData = context.sharedContext.presentationData
++    let signal = combineLatest(queue: .mainQueue(), presentationData, withLoading)
++    |> deliverOnMainQueue
++    |> map { presentationData, data -> (ItemListControllerState, (ItemListNodeState, Any)) in
++        var entries: [HBOLTActivityEntry] = []
++        if data.loading {
++            entries.append(.status("Loading…"))
++        } else if data.rows.isEmpty {
++            entries.append(.status("No recent messages from this user in your shared groups."))
++        } else {
++            var index = 0
++            let dateFormatter = DateFormatter()
++            dateFormatter.dateStyle = .short
++            dateFormatter.timeStyle = .short
++            for row in data.rows {
++                let date = dateFormatter.string(from: Date(timeIntervalSince1970: Double(row.timestamp)))
++                entries.append(.row(index: index, peerId: row.peerId, messageId: row.messageId, title: "\(row.groupTitle) · \(date)\n\(row.text)"))
++                index += 1
++            }
++        }
++        let controllerState = ItemListControllerState(presentationData: ItemListPresentationData(presentationData), title: .text("Recent activity"), leftNavigationButton: nil, rightNavigationButton: nil, backNavigationButton: ItemListBackButton(title: presentationData.strings.Common_Back), animateChanges: false)
++        let listState = ItemListNodeState(presentationData: ItemListPresentationData(presentationData), entries: entries, style: .blocks, animateChanges: true)
++        return (controllerState, (listState, arguments))
++    }
++
++    let controller = ItemListController(context: context, state: signal)
++
++    openGroupImpl = { [weak controller] peerId in
++        guard let navigationController = controller?.navigationController as? NavigationController else {
++            return
++        }
++        let _ = (context.engine.data.get(TelegramEngine.EngineData.Item.Peer.Peer(id: peerId))
++        |> deliverOnMainQueue).startStandalone(next: { peer in
++            guard let peer else {
++                return
++            }
++            context.sharedContext.navigateToChatController(NavigateToChatControllerParams(navigationController: navigationController, context: context, chatLocation: .peer(peer), keepStack: .default))
++        })
++    }
++
++    return controller
++}
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
+index 0095a8cc7..6123b739a 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
+@@ -482,15 +482,7 @@ func infoItems(
+                     guard let navigationController = interaction.getController()?.navigationController as? NavigationController else {
+                         return
+                     }
+-                    let _ = (hboltGroupsInCommon.state
+-                    |> take(1)
+-                    |> deliverOnMainQueue).startStandalone(next: { state in
+-                        let groups = state.peers.compactMap { $0.peer }
+-                        guard let first = groups.first else {
+-                            return
+-                        }
+-                        context.sharedContext.navigateToChatController(NavigateToChatControllerParams(navigationController: navigationController, context: context, chatLocation: .peer(EnginePeer(first)), keepStack: .default, activateMessageSearch: (.member(user), "")))
+-                    })
++                    navigationController.pushViewController(hboltActivityFeedController(context: context, targetPeerId: user.id, groupsInCommon: hboltGroupsInCommon))
+                 }))
+             }
+ 
