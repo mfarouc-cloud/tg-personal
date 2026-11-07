@@ -1,0 +1,28 @@
+diff --git a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift
+index 0b8ce5349..212b59140 100644
+--- a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
++++ b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
+@@ -883,7 +883,6 @@ private func privacyAndSecurityControllerEntries(
+     entries.append(.hboltSwitch(13, "📸 Forward single media to private chats as View Once", HBOLTSettings.value("hbolt.viewOnceToPrivate")))
+     entries.append(.hboltSwitch(5, "🔗 Expired links recovery", HBOLTSettings.value("hbolt.linkRecovery")))
+     entries.append(.hboltSwitch(3, "🚫 Hide sponsored messages (HBOLT)", HBOLTSettings.hideSponsored))
+-    entries.append(.hboltSwitch(12, "🔐 Keep login after reinstall (this device only)", HBOLTSettings.value("hbolt.keepLogin")))
+     entries.append(.hboltSwitch(4, "🕘 Keep edit history (HBOLT)", HBOLTSettings.keepEdits))
+ 
+     return entries
+diff --git a/submodules/TelegramCore/Sources/HBOLTSessionKeychain.swift b/submodules/TelegramCore/Sources/HBOLTSessionKeychain.swift
+index 78427e073..1bd6b04f3 100644
+--- a/submodules/TelegramCore/Sources/HBOLTSessionKeychain.swift
++++ b/submodules/TelegramCore/Sources/HBOLTSessionKeychain.swift
+@@ -10,7 +10,10 @@ public enum HBOLTSessionKeychain {
+     private static let account = "accounts"
+ 
+     public static var enabled: Bool {
+-        return HBOLTSettings.value("hbolt.keepLogin")
++        // HBOLT 0022: disabled. The keep-login-after-reinstall backup/restore raced with
++        // Telegram's native multi-account persistence and dropped the second account on cold
++        // start. Native AccountManager handles multi-account correctly on its own.
++        return false
+     }
+ 
+     private static var baseQuery: [String: Any] {
