@@ -41,7 +41,7 @@ jobs:
         run: native/apply-hbolt.sh tgios
 
       - name: Fresh codesigning profiles (upstream fake ones expired 2026-10-30)
-        run: python3 native/make-profiles.py tgios/build-system/fake-codesigning com.farouk.hbolt
+        run: python3 native/make-profiles.py tgios/build-system/fake-codesigning com.hbolt.app
 
       - name: Import build-time signing identity (Telegram fake-codesigning cert)
         run: |
@@ -70,7 +70,7 @@ jobs:
           mkdir -p cfg
           cat > cfg/configuration.json <<JSON
           {
-            "bundle_id": "com.farouk.hbolt",
+            "bundle_id": "com.hbolt.app",
             "api_id": "$API_ID",
             "api_hash": "$API_HASH",
             "team_id": "C67CF9S4VU",
