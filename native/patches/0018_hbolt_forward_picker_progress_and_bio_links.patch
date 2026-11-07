@@ -1,0 +1,107 @@
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
+index 288ca170c..01dd415d4 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
+@@ -341,6 +341,44 @@ func infoItems(
+                     } : nil, linkItemAction: bioLinkAction, button: actionButton, contextAction: bioContextAction, requestLayout: { animated in
+                         interaction.requestLayout(animated)
+                     }))
++
++                    // HBOLT: surface public @handles / t.me links in the bio as tappable shortcuts.
++                    if let hboltAbout = cachedData.about, !hboltAbout.isEmpty {
++                        let hboltScanner = hboltAbout.replacingOccurrences(of: "t.me/", with: "@").replacingOccurrences(of: "T.me/", with: "@") + " "
++                        var hboltSeen = Set<String>()
++                        var hboltHandles: [String] = []
++                        var hboltCurrent = ""
++                        var hboltCollecting = false
++                        for ch in hboltScanner {
++                            if ch == "@" {
++                                hboltCollecting = true
++                                hboltCurrent = ""
++                            } else if hboltCollecting {
++                                if ch.isLetter || ch.isNumber || ch == "_" {
++                                    hboltCurrent.append(ch)
++                                } else {
++                                    if hboltCurrent.count >= 4 && hboltCurrent.count <= 32 {
++                                        let lower = hboltCurrent.lowercased()
++                                        if !hboltSeen.contains(lower) {
++                                            hboltSeen.insert(lower)
++                                            hboltHandles.append(hboltCurrent)
++                                        }
++                                    }
++                                    hboltCollecting = false
++                                }
++                            }
++                        }
++                        var hboltLinkId = 9_200_001
++                        for hboltHandle in hboltHandles.prefix(10) {
++                            let h = hboltHandle
++                            items[currentPeerInfoSection]!.append(PeerInfoScreenLabeledValueItem(id: hboltLinkId, label: "Public link", text: "@\(h)", textColor: .accent, textBehavior: .multiLine(maxLines: 1, enabledEntities: []), action: { _, _ in
++                                interaction.openPeerMention(h, .default)
++                            }, requestLayout: { animated in
++                                interaction.requestLayout(animated)
++                            }))
++                            hboltLinkId += 1
++                        }
++                    }
+                 }
+                 
+                 if let note = cachedData.note, !note.text.isEmpty {
+diff --git a/submodules/TelegramUI/Sources/ChatController.swift b/submodules/TelegramUI/Sources/ChatController.swift
+index 665cdd4f8..42b7f53c4 100644
+--- a/submodules/TelegramUI/Sources/ChatController.swift
++++ b/submodules/TelegramUI/Sources/ChatController.swift
+@@ -7078,6 +7078,36 @@ public final class ChatControllerImpl: TelegramBaseController, ChatController, G
+     private var hboltForwardProgressController: UndoOverlayController?
+     private var hboltForwardProgressDisposable: Disposable?
+ 
++    // HBOLT: same counter, but for forwards sent to one or more OTHER chats (forward picker).
++    func hboltShowForwardProgress(peerIds: Set<PeerId>, total: Int) {
++        self.hboltForwardProgressDisposable?.dispose()
++        let makeContent: (Int) -> UndoOverlayContent = { remaining in
++            return .info(title: nil, text: "Forwarding \(remaining)…", timeout: nil, customUndoText: nil)
++        }
++        if let existing = self.hboltForwardProgressController {
++            existing.content = makeContent(total)
++        } else {
++            let controller = UndoOverlayController(presentationData: self.presentationData, content: makeContent(total), elevatedLayout: false, position: .top, action: { _ in return false })
++            self.hboltForwardProgressController = controller
++            self.present(controller, in: .window(.root))
++        }
++        self.hboltForwardProgressDisposable = (self.context.account.postbox.unsentMessageIdsView()
++        |> deliverOnMainQueue).startStrict(next: { [weak self] view in
++            guard let self else {
++                return
++            }
++            let remaining = view.ids.filter({ peerIds.contains($0.peerId) }).count
++            if remaining <= 0 {
++                self.hboltForwardProgressController?.dismiss()
++                self.hboltForwardProgressController = nil
++                self.hboltForwardProgressDisposable?.dispose()
++                self.hboltForwardProgressDisposable = nil
++            } else {
++                self.hboltForwardProgressController?.content = makeContent(remaining)
++            }
++        })
++    }
++
+     // HBOLT: window-level "Forwarding N…" counter driven by the real unsent-message queue.
+     // Shown for bulk sends/forwards into this chat; floats over whatever screen is open and
+     // ticks down as Telegram's send queue drains, then dismisses.
+diff --git a/submodules/TelegramUI/Sources/ChatControllerForwardMessages.swift b/submodules/TelegramUI/Sources/ChatControllerForwardMessages.swift
+index 7ec672a6e..52ea992b7 100644
+--- a/submodules/TelegramUI/Sources/ChatControllerForwardMessages.swift
++++ b/submodules/TelegramUI/Sources/ChatControllerForwardMessages.swift
+@@ -191,6 +191,12 @@ extension ChatControllerImpl {
+                                     return
+                                 }
+                                 
++                                let hboltTargetIds = Set(targetPeersShouldDivert.map { $0.0.id })
++                                let hboltTotal = result.count * max(1, targetPeersShouldDivert.count)
++                                if hboltTotal >= 10 {
++                                    strongSelf.hboltShowForwardProgress(peerIds: hboltTargetIds, total: hboltTotal)
++                                }
++                                
+                                 var displayConvertingTooltip = false
+                                 
+                                 var displayPeers: [EnginePeer] = []
