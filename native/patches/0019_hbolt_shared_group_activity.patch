@@ -1,0 +1,31 @@
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
+index 01dd415d4..8a33e2ac4 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
+@@ -475,6 +475,26 @@ func infoItems(
+                 }))
+             }
+ 
++            // HBOLT: open the user's recent activity in a shared group using Telegram's native
++            // member-filtered message search. Scoped to groups you share — no cross-Telegram indexing.
++            if let hboltGroupsInCommon = data.groupsInCommon, user.botInfo == nil {
++                let hboltTargetPeer: Peer = user
++                items[currentPeerInfoSection]!.append(PeerInfoScreenActionItem(id: 9_300_001, text: "📊 Recent activity in shared groups", action: {
++                    guard let navigationController = interaction.getController()?.navigationController as? NavigationController else {
++                        return
++                    }
++                    let _ = (hboltGroupsInCommon.state
++                    |> take(1)
++                    |> deliverOnMainQueue).startStandalone(next: { state in
++                        let groups = state.peers.compactMap { $0.peer }
++                        guard let first = groups.first else {
++                            return
++                        }
++                        context.sharedContext.navigateToChatController(NavigateToChatControllerParams(navigationController: navigationController, context: context, chatLocation: .peer(EnginePeer(first)), keepStack: .default, activateMessageSearch: (.member(hboltTargetPeer), "")))
++                    })
++                }))
++            }
++
+             if let reactionSourceMessageId = reactionSourceMessageId {
+                 if canDeleteReaction {
+                     items[currentPeerInfoSection]!.append(PeerInfoScreenActionItem(id: ItemDeleteReaction, text: presentationData.strings.PeerInfo_DeleteReaction, color: .destructive, action: {
