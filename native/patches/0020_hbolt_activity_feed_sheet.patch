@@ -1,9 +1,9 @@
 diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/HBOLTActivityFeed.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/HBOLTActivityFeed.swift
 new file mode 100644
-index 000000000..38d7107f5
+index 000000000..610c3faf8
 --- /dev/null
 +++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/HBOLTActivityFeed.swift
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,181 @@
 +import Foundation
 +import UIKit
 +import Display
@@ -128,9 +128,6 @@ index 000000000..38d7107f5
 +                    return HBOLTActivityRow(peerId: groupId, messageId: message.id, groupTitle: groupTitle, text: snippet, timestamp: message.timestamp)
 +                }
 +            }
-+            |> `catch` { _ -> Signal<[HBOLTActivityRow], NoError> in
-+                return .single([])
-+            }
 +        }
 +        return combineLatest(queries)
 +        |> map { lists -> HBOLTActivityData in
@@ -189,10 +186,10 @@ index 000000000..38d7107f5
 +    return controller
 +}
 diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
-index 0095a8cc7..6123b739a 100644
+index 129e951cd..716dd7f54 100644
 --- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
 +++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
-@@ -482,15 +482,7 @@ func infoItems(
+@@ -452,15 +452,7 @@ func infoItems(
                      guard let navigationController = interaction.getController()?.navigationController as? NavigationController else {
                          return
                      }
