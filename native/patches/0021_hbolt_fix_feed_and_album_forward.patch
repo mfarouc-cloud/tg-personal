@@ -1,0 +1,66 @@
+diff --git a/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift b/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
+index 3391e06a6..5a62163bb 100644
+--- a/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
++++ b/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
+@@ -702,45 +702,15 @@ public func enqueueMessages(account: Account, peerId: PeerId, messages: [Enqueue
+ }
+ 
+ private func hboltEnqueueAfterViewOnce(account: Account, peerId: PeerId, messages: [EnqueueMessage]) -> Signal<[MessageId?], NoError> {
+-    let forwardCount = messages.filter({ if case .forward = $0 { return true } else { return false } }).count
+-    if forwardCount > 10 {
+-        // HBOLT: bulk forwarding goes out in chunks of 10, 500 ms apart (flood-safe, UI stays responsive).
+-        var chunks: [[EnqueueMessage]] = []
+-        var index = 0
+-        while index < messages.count {
+-            chunks.append(Array(messages[index ..< min(index + 10, messages.count)]))
+-            index += 10
+-        }
+-        return hboltEnqueueChunks(account: account, peerId: peerId, chunks: chunks[...], isFirst: true)
+-    }
++    // HBOLT: forwards go through Telegram's native send queue, which paces sends, respects
++    // FLOOD_WAIT, retries, and keeps albums grouped. (Earlier manual 10-item chunking split
++    // albums across batches and could drop forwards, so it was removed.)
+     return hboltRewriteProtectedForwards(account: account, messages: messages)
+     |> mapToSignal { messages -> Signal<[MessageId?], NoError> in
+         return hboltEnqueueMessagesImpl(account: account, peerId: peerId, messages: messages)
+     }
+ }
+ 
+-private func hboltEnqueueChunks(account: Account, peerId: PeerId, chunks: ArraySlice<[EnqueueMessage]>, isFirst: Bool) -> Signal<[MessageId?], NoError> {
+-    guard let chunk = chunks.first else {
+-        return .single([])
+-    }
+-    let rest = chunks.dropFirst()
+-    let start: Signal<Void, NoError> = isFirst ? .single(Void()) : (.single(Void()) |> delay(0.5, queue: Queue.concurrentDefaultQueue()))
+-    return start
+-    |> mapToSignal { _ -> Signal<[MessageId?], NoError> in
+-        return hboltRewriteProtectedForwards(account: account, messages: chunk)
+-        |> mapToSignal { messages -> Signal<[MessageId?], NoError> in
+-            return hboltEnqueueMessagesImpl(account: account, peerId: peerId, messages: messages)
+-        }
+-    }
+-    |> take(1)
+-    |> mapToSignal { ids -> Signal<[MessageId?], NoError> in
+-        return hboltEnqueueChunks(account: account, peerId: peerId, chunks: rest, isFirst: false)
+-        |> map { restIds -> [MessageId?] in
+-            return ids + restIds
+-        }
+-    }
+-}
+-
+ private func hboltEnqueueMessagesImpl(account: Account, peerId: PeerId, messages: [EnqueueMessage]) -> Signal<[MessageId?], NoError> {
+     let signal: Signal<[(Bool, EnqueueMessage)], NoError>
+     if let transformOutgoingMessageMedia = account.transformOutgoingMessageMedia {
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/HBOLTActivityFeed.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/HBOLTActivityFeed.swift
+index 610c3faf8..de3a8be00 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/HBOLTActivityFeed.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/HBOLTActivityFeed.swift
+@@ -73,7 +73,7 @@ private enum HBOLTActivityEntry: ItemListNodeEntry {
+         case let .status(text):
+             return ItemListTextItem(presentationData: presentationData, text: .plain(text), sectionId: self.section)
+         case let .row(_, peerId, _, title):
+-            return ItemListActionItem(presentationData: presentationData, title: title, kind: .generic, alignment: .natural, sectionId: self.section, style: .blocks, action: {
++            return ItemListMultilineTextItem(presentationData: presentationData, text: title, enabledEntityTypes: [], sectionId: self.section, style: .blocks, action: {
+                 arguments.openGroup(peerId)
+             })
+         }
