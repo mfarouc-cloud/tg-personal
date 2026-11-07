@@ -1,15 +1,14 @@
 diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
-index 01dd415d4..8a33e2ac4 100644
+index 01dd415d4..0095a8cc7 100644
 --- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
 +++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
-@@ -475,6 +475,26 @@ func infoItems(
+@@ -475,6 +475,25 @@ func infoItems(
                  }))
              }
  
-+            // HBOLT: open the user's recent activity in a shared group using Telegram's native
++            // HBOLT: open the user's recent activity in a shared group via Telegram's native
 +            // member-filtered message search. Scoped to groups you share — no cross-Telegram indexing.
 +            if let hboltGroupsInCommon = data.groupsInCommon, user.botInfo == nil {
-+                let hboltTargetPeer: Peer = user
 +                items[currentPeerInfoSection]!.append(PeerInfoScreenActionItem(id: 9_300_001, text: "📊 Recent activity in shared groups", action: {
 +                    guard let navigationController = interaction.getController()?.navigationController as? NavigationController else {
 +                        return
@@ -21,7 +20,7 @@ index 01dd415d4..8a33e2ac4 100644
 +                        guard let first = groups.first else {
 +                            return
 +                        }
-+                        context.sharedContext.navigateToChatController(NavigateToChatControllerParams(navigationController: navigationController, context: context, chatLocation: .peer(EnginePeer(first)), keepStack: .default, activateMessageSearch: (.member(hboltTargetPeer), "")))
++                        context.sharedContext.navigateToChatController(NavigateToChatControllerParams(navigationController: navigationController, context: context, chatLocation: .peer(EnginePeer(first)), keepStack: .default, activateMessageSearch: (.member(user), "")))
 +                    })
 +                }))
 +            }
