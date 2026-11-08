@@ -1,0 +1,166 @@
+diff --git a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift
+index 212b59140..5c2b1b873 100644
+--- a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
++++ b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
+@@ -229,7 +229,7 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+             case .hboltGhostMode:
+                 return 100
+             case let .hboltSwitch(id, _, _):
+-                let order: [Int32: Int32] = [7: 1, 8: 2, 9: 3, 10: 4, 1: 5, 4: 6, 2: 7, 11: 8, 13: 9, 6: 10, 5: 11, 3: 12, 12: 13]
++                let order: [Int32: Int32] = [7: 1, 8: 2, 9: 3, 10: 4, 1: 5, 4: 6, 2: 7, 11: 8, 13: 9, 14: 10, 6: 11, 5: 12, 3: 13, 12: 14]
+                 return 100 + (order[id] ?? (20 + id))
+         }
+     }
+@@ -462,6 +462,7 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+                     case 5: HBOLTSettings.setValue("hbolt.linkRecovery", value)
+                     case 11: HBOLTSettings.setValue("hbolt.bulkSelect", value)
+                     case 13: HBOLTSettings.setValue("hbolt.viewOnceToPrivate", value)
++                    case 14: HBOLTSettings.setValue("hbolt.groupForwardAlbums", value)
+                     case 12:
+                         HBOLTSettings.setValue("hbolt.keepLogin", value)
+                         if !value {
+@@ -881,6 +882,7 @@ private func privacyAndSecurityControllerEntries(
+     entries.append(.hboltSwitch(11, "☑️ Bulk select & multi-forward", HBOLTSettings.value("hbolt.bulkSelect")))
+     entries.append(.hboltSwitch(6, "↪️ Protected media forward bypass (download + re-upload)", HBOLTSettings.value("hbolt.protectedForward")))
+     entries.append(.hboltSwitch(13, "📸 Forward single media to private chats as View Once", HBOLTSettings.value("hbolt.viewOnceToPrivate")))
++    entries.append(.hboltSwitch(14, "🖼 Group forwarded media into albums of 10 (re-upload)", HBOLTSettings.value("hbolt.groupForwardAlbums")))
+     entries.append(.hboltSwitch(5, "🔗 Expired links recovery", HBOLTSettings.value("hbolt.linkRecovery")))
+     entries.append(.hboltSwitch(3, "🚫 Hide sponsored messages (HBOLT)", HBOLTSettings.hideSponsored))
+     entries.append(.hboltSwitch(4, "🕘 Keep edit history (HBOLT)", HBOLTSettings.keepEdits))
+diff --git a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+index f8ded81db..2d41d8185 100644
+--- a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+@@ -62,7 +62,7 @@ private func hboltCopyResource(account: Account, message: Message, media: Media,
+ }
+ 
+ /// Turns `.forward` of protected content into `.message` with re-uploaded copies.
+-private func hboltResend(account: Account, message: Message, threadId: Int64?, grouping: EnqueueMessageGrouping, attributes: [MessageAttribute], correlationId: Int64?, groupingKeys: [Int64: Int64], viewOnce: Bool = false) -> Signal<EnqueueMessage, NoError> {
++private func hboltResend(account: Account, message: Message, threadId: Int64?, grouping: EnqueueMessageGrouping, attributes: [MessageAttribute], correlationId: Int64?, groupingKeys: [Int64: Int64], viewOnce: Bool = false, forcedGroupingKey: Int64? = nil) -> Signal<EnqueueMessage, NoError> {
+     var copiedAttributes: [MessageAttribute] = attributes.filter { !($0 is TextEntitiesMessageAttribute) && !($0 is AutoremoveTimeoutMessageAttribute) }
+     if let entities = message.attributes.first(where: { $0 is TextEntitiesMessageAttribute }) {
+         copiedAttributes.append(entities)
+@@ -71,7 +71,9 @@ private func hboltResend(account: Account, message: Message, threadId: Int64?, g
+         copiedAttributes.append(AutoremoveTimeoutMessageAttribute(timeout: viewOnceTimeout, countdownBeginTime: nil))
+     }
+     var localGroupingKey: Int64?
+-    if case .auto = grouping, let key = message.groupingKey {
++    if let forcedGroupingKey = forcedGroupingKey {
++        localGroupingKey = forcedGroupingKey
++    } else if case .auto = grouping, let key = message.groupingKey {
+         localGroupingKey = groupingKeys[key]
+     }
+     let build: (AnyMediaReference?) -> EnqueueMessage = { mediaReference in
+@@ -143,6 +145,76 @@ func hboltRewriteProtectedForwards(account: Account, messages: [EnqueueMessage])
+ public extension HBOLTSettings {
+     /// When forwarding a single photo/video into a private chat, re-upload it as view-once.
+     static var viewOnceToPrivate: Bool { return value("hbolt.viewOnceToPrivate") }
++    /// Re-upload forwarded photos/videos and bundle them into native albums of up to 10.
++    static var groupForwardAlbums: Bool { return value("hbolt.groupForwardAlbums") }
++}
++
++private func hboltIsAlbumableMedia(_ message: Message) -> Bool {
++    // Exactly one photo or video and nothing else — the only things Telegram albums accept together.
++    guard message.media.count == 1, let media = message.media.first else {
++        return false
++    }
++    if media is TelegramMediaImage {
++        return true
++    }
++    if let file = media as? TelegramMediaFile, file.isVideo {
++        return true
++    }
++    return false
++}
++
++/// HBOLT: opt-in. Re-upload forwarded photos/videos and group them into albums of up to 10,
++/// even when the originals were standalone messages. Non-media items pass through unchanged.
++func hboltRewriteGroupAlbums(account: Account, peerId: PeerId, messages: [EnqueueMessage]) -> Signal<[EnqueueMessage], NoError> {
++    guard HBOLTSettings.groupForwardAlbums else {
++        return .single(messages)
++    }
++    let forwardCount = messages.reduce(0) { acc, item in
++        if case .forward = item { return acc + 1 } else { return acc }
++    }
++    if forwardCount < 2 {
++        return .single(messages)
++    }
++    return account.postbox.transaction { transaction -> [Message?] in
++        return messages.map { item -> Message? in
++            if case let .forward(source, _, _, _, _) = item {
++                return transaction.getMessage(source)
++            }
++            return nil
++        }
++    }
++    |> mapToSignal { sources -> Signal<[EnqueueMessage], NoError> in
++        var mediaIndices: [Int] = []
++        for (index, item) in messages.enumerated() {
++            if case .forward = item, let source = sources[index], hboltIsAlbumableMedia(source) {
++                mediaIndices.append(index)
++            }
++        }
++        if mediaIndices.count < 2 {
++            return .single(messages)
++        }
++        var keyForIndex: [Int: Int64] = [:]
++        var g = 0
++        while g < mediaIndices.count {
++            let upper = min(g + 10, mediaIndices.count)
++            if upper - g >= 2 {
++                let key = Int64.random(in: Int64.min ... Int64.max)
++                for j in g ..< upper {
++                    keyForIndex[mediaIndices[j]] = key
++                }
++            }
++            g += 10
++        }
++        var signals: [Signal<EnqueueMessage, NoError>] = []
++        for (index, item) in messages.enumerated() {
++            if let key = keyForIndex[index], case let .forward(_, threadId, _, attributes, correlationId) = item, let source = sources[index] {
++                signals.append(hboltResend(account: account, message: source, threadId: threadId, grouping: .none, attributes: attributes, correlationId: correlationId, groupingKeys: [:], forcedGroupingKey: key))
++            } else {
++                signals.append(.single(item))
++            }
++        }
++        return combineLatest(signals)
++    }
+ }
+ 
+ /// HBOLT: for a private (user) target, rewrite single-photo/single-video forwards into
+diff --git a/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift b/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
+index 5a62163bb..92cd02fd5 100644
+--- a/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
++++ b/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
+@@ -697,7 +697,10 @@ private func opportunisticallyTransformOutgoingMedia(network: Network, postbox:
+ public func enqueueMessages(account: Account, peerId: PeerId, messages: [EnqueueMessage]) -> Signal<[MessageId?], NoError> {
+     return hboltRewriteViewOnce(account: account, peerId: peerId, messages: messages)
+     |> mapToSignal { messages -> Signal<[MessageId?], NoError> in
+-        return hboltEnqueueAfterViewOnce(account: account, peerId: peerId, messages: messages)
++        return hboltRewriteGroupAlbums(account: account, peerId: peerId, messages: messages)
++        |> mapToSignal { messages -> Signal<[MessageId?], NoError> in
++            return hboltEnqueueAfterViewOnce(account: account, peerId: peerId, messages: messages)
++        }
+     }
+ }
+ 
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
+index 6123b739a..21da0daaf 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
+@@ -194,6 +194,15 @@ func infoItems(
+         do {
+             let hboltUserId = "\(user.id.id._internalGetInt64Value())"
+             var hboltLines: [String] = ["User ID: \(hboltUserId)"]
++            let hboltUidValue = user.id.id._internalGetInt64Value()
++            let hboltMilestones: [(Int64, String)] = [(1_000_000, "2013"), (50_000_000, "2014"), (100_000_000, "2016"), (200_000_000, "2017"), (300_000_000, "2018"), (500_000_000, "2019"), (1_000_000_000, "2020"), (1_300_000_000, "2021"), (2_000_000_000, "2022"), (5_500_000_000, "2023"), (6_500_000_000, "2024")]
++            var hboltEst = hboltMilestones.first?.1 ?? ""
++            for milestone in hboltMilestones where hboltUidValue >= milestone.0 {
++                hboltEst = milestone.1
++            }
++            if !hboltEst.isEmpty {
++                hboltLines.append("Est. joined: ~\(hboltEst) (rough, from ID)")
++            }
+             if let photoResource = user.photo.first?.resource as? CloudPeerPhotoSizeMediaResource {
+                 hboltLines.append("Data center: DC\(photoResource.datacenterId)")
+             }
