@@ -1,0 +1,107 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTSettings.swift b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+index 2b3e8a943..bd26549de 100644
+--- a/submodules/TelegramCore/Sources/HBOLTSettings.swift
++++ b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+@@ -41,43 +41,80 @@ public enum HBOLTSettings {
+         set { defaults.set(newValue, forKey: "hbolt.keepEdits") }
+     }
+ 
+-    private static let editsQueue = DispatchQueue(label: "hbolt.edits")
+-    private static var editsCache: [String: [String]]?
++    // HBOLT 0023: in-memory store guarded by a lock; reads never touch disk or wait on a
++    // write queue (the old editsQueue.sync blocked the main thread during long-press). Writes
++    // are coalesced to at most one file write every few seconds instead of one per edit.
++    private static let editsLock = NSLock()
++    private static var editsMap: [String: [String]] = [:]
++    private static var editsLoaded = false
++    private static var editsDirty = false
++    private static var editsWriteScheduled = false
++    private static let editsIO = DispatchQueue(label: "hbolt.edits.io", qos: .utility)
++
+     private static var editsURL: URL? {
+         guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+         return base.appendingPathComponent("hbolt-edit-history.json")
+     }
+-    private static func loadEdits() -> [String: [String]] {
+-        if let c = editsCache { return c }
+-        var result: [String: [String]] = [:]
++
++    private static func ensureEditsLoadedLocked() {
++        if editsLoaded { return }
++        editsLoaded = true
+         if let url = editsURL, let data = try? Data(contentsOf: url), let decoded = try? JSONDecoder().decode([String: [String]].self, from: data) {
+-            result = decoded
++            editsMap = decoded
+         }
+-        editsCache = result
+-        return result
+     }
+ 
+-    /// Called just before an edit replaces a message's text.
++    private static func flushEdits() {
++        editsLock.lock()
++        editsWriteScheduled = false
++        guard editsDirty else {
++            editsLock.unlock()
++            return
++        }
++        editsDirty = false
++        let snapshot = editsMap
++        editsLock.unlock()
++        if let url = editsURL, let data = try? JSONEncoder().encode(snapshot) {
++            try? data.write(to: url, options: .atomic)
++        }
++    }
++
++    /// Called just before an edit replaces a message's text. Updates memory immediately and
++    /// schedules a single coalesced write.
+     public static func recordEdit(peerId: Int64, messageId: Int32, oldText: String) {
+         guard keepEdits, !oldText.isEmpty else { return }
+-        editsQueue.async {
+-            var all = loadEdits()
+-            let key = "\(peerId):\(messageId)"
+-            var list = all[key] ?? []
+-            if list.last == oldText { return }
+-            list.append(oldText)
+-            if list.count > 50 { list.removeFirst(list.count - 50) }
+-            all[key] = list
+-            if all.count > 20000, let k = all.keys.first { all.removeValue(forKey: k) }
+-            editsCache = all
+-            if let url = editsURL, let data = try? JSONEncoder().encode(all) { try? data.write(to: url, options: .atomic) }
++        let key = "\(peerId):\(messageId)"
++        editsLock.lock()
++        ensureEditsLoadedLocked()
++        var list = editsMap[key] ?? []
++        if list.last == oldText {
++            editsLock.unlock()
++            return
++        }
++        list.append(oldText)
++        if list.count > 50 { list.removeFirst(list.count - 50) }
++        editsMap[key] = list
++        if editsMap.count > 20000, let k = editsMap.keys.first { editsMap.removeValue(forKey: k) }
++        editsDirty = true
++        let shouldSchedule = !editsWriteScheduled
++        if shouldSchedule { editsWriteScheduled = true }
++        editsLock.unlock()
++        if shouldSchedule {
++            editsIO.asyncAfter(deadline: .now() + 5.0) {
++                flushEdits()
++            }
+         }
+     }
+ 
+-    /// Previous versions (oldest first) of a message's text.
++    /// Previous versions (oldest first) of a message's text. Non-blocking: in-memory lookup.
+     public static func editHistory(peerId: Int64, messageId: Int32) -> [String] {
+-        return editsQueue.sync { loadEdits()["\(peerId):\(messageId)"] ?? [] }
++        let key = "\(peerId):\(messageId)"
++        editsLock.lock()
++        ensureEditsLoadedLocked()
++        let result = editsMap[key] ?? []
++        editsLock.unlock()
++        return result
+     }
+ 
+     /// Don't fetch or show sponsored messages in channels.
