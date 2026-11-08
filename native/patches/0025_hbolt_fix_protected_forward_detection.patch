@@ -1,0 +1,59 @@
+diff --git a/submodules/TelegramCore/Sources/ApiUtils/StoreMessage_Telegram.swift b/submodules/TelegramCore/Sources/ApiUtils/StoreMessage_Telegram.swift
+index e2875631d..53b2d2976 100644
+--- a/submodules/TelegramCore/Sources/ApiUtils/StoreMessage_Telegram.swift
++++ b/submodules/TelegramCore/Sources/ApiUtils/StoreMessage_Telegram.swift
+@@ -1491,8 +1491,11 @@ extension StoreMessage {
+                     storeFlags.insert(.CountedAsIncoming)
+                 }
+             
+-                if (flags & (1 << 26)) != 0 && !HBOLTSettings.bypassProtection {
+-                    storeFlags.insert(.CopyProtected)
++                if (flags & (1 << 26)) != 0 {
++                    HBOLTSettings.markProtected(peerId.toInt64())
++                    if !HBOLTSettings.bypassProtection {
++                        storeFlags.insert(.CopyProtected)
++                    }
+                 }
+             
+                 if (flags & (1 << 27)) != 0 {
+@@ -1669,8 +1672,11 @@ extension StoreMessage {
+                     storeFlags.insert(.WasScheduled)
+                 }
+             
+-                if (flags & (1 << 26)) != 0 && !HBOLTSettings.bypassProtection {
+-                    storeFlags.insert(.CopyProtected)
++                if (flags & (1 << 26)) != 0 {
++                    HBOLTSettings.markProtected(peerId.toInt64())
++                    if !HBOLTSettings.bypassProtection {
++                        storeFlags.insert(.CopyProtected)
++                    }
+                 }
+             
+                 if (flags & (1 << 27)) != 0 {
+diff --git a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+index 2d41d8185..07ed4f89c 100644
+--- a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+@@ -9,15 +9,20 @@ import SwiftSignalKit
+ 
+ private let protectedLock = NSLock()
+ private var protectedPeers: Set<Int64> = {
+-    return Set((UserDefaults.standard.array(forKey: "hbolt.protectedPeers") as? [Int64]) ?? [])
++    // NOTE: stored as [String]. UserDefaults bridges Int64 arrays to [NSNumber],
++    // and reading them back with `as? [Int64]` returns nil on most launches,
++    // which silently emptied this set across restarts. Strings round-trip reliably.
++    let raw = (UserDefaults.standard.array(forKey: "hbolt.protectedPeers") as? [String]) ?? []
++    return Set(raw.compactMap { Int64($0) })
+ }()
+ 
+ extension HBOLTSettings {
+     /// Remembered at parse time (the flag itself is stripped so saving works).
+     public static func markProtected(_ peerId: Int64) {
++        guard peerId != 0 else { return }
+         protectedLock.lock()
+         let inserted = protectedPeers.insert(peerId).inserted
+-        let snapshot = inserted ? Array(protectedPeers) : nil
++        let snapshot = inserted ? protectedPeers.map { String($0) } : nil
+         protectedLock.unlock()
+         if let snapshot = snapshot {
+             UserDefaults.standard.set(snapshot, forKey: "hbolt.protectedPeers")
