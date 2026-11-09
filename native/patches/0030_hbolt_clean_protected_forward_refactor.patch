@@ -1,0 +1,323 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+index dbbba80a1..395dbcef8 100644
+--- a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+@@ -2,22 +2,25 @@ import Foundation
+ import Postbox
+ import SwiftSignalKit
+ 
+-// HBOLT: forwarding from chats with "restrict saving content".
++// HBOLT: forwarding from chats with "restrict saving content" (noforwards).
+ // The server refuses messages.forwardMessages for those chats (CHAT_FORWARDS_RESTRICTED),
+-// so — like the HBOLT PWA did — the content is downloaded locally and sent again as a
+-// brand-new message (same text, formatting entities, media attributes and album grouping).
++// so the content is re-sent as a brand-new standalone message that carries NO forwarding
++// provenance: the cached media bytes are read off disk and uploaded fresh via a
++// LocalFileReferenceMediaResource, exactly as the photo picker / share extension do. If the
++// media is not on disk yet it is downloaded first and sent when ready — a broken/empty message
++// is never dispatched, and the enqueue pipeline is never blocked.
+ 
+ private let protectedLock = NSLock()
+ private var protectedPeers: Set<Int64> = {
+-    // NOTE: stored as [String]. UserDefaults bridges Int64 arrays to [NSNumber],
+-    // and reading them back with `as? [Int64]` returns nil on most launches,
+-    // which silently emptied this set across restarts. Strings round-trip reliably.
++    // Stored as [String]: UserDefaults bridges Int64 arrays to [NSNumber], and reading them back
++    // with `as? [Int64]` returns nil on most launches, which silently emptied this set across
++    // restarts. Strings round-trip reliably.
+     let raw = (UserDefaults.standard.array(forKey: "hbolt.protectedPeers") as? [String]) ?? []
+     return Set(raw.compactMap { Int64($0) })
+ }()
+ 
+ extension HBOLTSettings {
+-    /// Remembered at parse time (the flag itself is stripped so saving works).
++    /// Remembered at parse time (the CopyProtected flag itself is stripped so re-sending works).
+     public static func markProtected(_ peerId: Int64) {
+         guard peerId != 0 else { return }
+         protectedLock.lock()
+@@ -36,9 +39,8 @@ extension HBOLTSettings {
+     }
+ }
+ 
+-// Background prefetch handles kept alive intentionally: when a protected media isn't cached
+-// yet we warm the cache without blocking the send, so a later forward finds it on disk.
+-private let hboltPrefetchDisposables = DisposableSet()
++// Keeps async download-then-send operations alive until they finish.
++private let hboltDeferredSends = DisposableSet()
+ 
+ private func hboltResourceForReupload(_ media: Media) -> (MediaResource, MediaResourceUserContentType, TelegramMediaImageRepresentation?)? {
+     if let image = media as? TelegramMediaImage, let largest = largestImageRepresentation(image.representations) {
+@@ -50,15 +52,14 @@ private func hboltResourceForReupload(_ media: Media) -> (MediaResource, MediaRe
+     return nil
+ }
+ 
+-/// Detaches a protected media into brand-new local bytes IF it is already complete on disk.
+-/// Synchronous: completedResourcePath gives the cached file on disk, which we copy to a unique
+-/// temp file in NSTemporaryDirectory and wrap in a LocalFileReferenceMediaResource — the exact
+-/// resource type the photo picker / share extension use to upload a file straight from disk. The
+-/// upload worker reads localFilePath directly and uploads fresh bytes, with NO cloud resource or
+-/// store id involved, so the server accepts it as an original message (no red !). Dimensions,
+-/// mime-type and attributes are carried over from the source so the payload validates. Returns
+-/// nil when the media is not cached or the copy fails, so the caller dispatches without blocking.
+-private func hboltDetachMediaIfCached(account: Account, message: Message, media: Media) -> Media? {
++/// Detaches a media into brand-new local bytes IF it is already complete on disk. Synchronous:
++/// completedResourcePath locates the cached file, which is copied to a unique temp file and
++/// wrapped in a LocalFileReferenceMediaResource — the exact resource type the photo picker / share
++/// extension use to upload a file straight from disk. The upload worker reads localFilePath
++/// directly and uploads fresh bytes, with NO cloud resource, store id or source reference, so the
++/// server accepts it as an original message. Dimensions, mime-type and attributes are carried over
++/// so the payload validates. Returns nil when the media is not cached or the copy fails.
++private func hboltDetachMediaIfCached(account: Account, media: Media) -> Media? {
+     guard let (resource, _, largest) = hboltResourceForReupload(media) else {
+         return nil
+     }
+@@ -90,61 +91,92 @@ private func hboltDetachMediaIfCached(account: Account, message: Message, media:
+     return nil
+ }
+ 
+-/// Fire-and-forget: warm the on-disk cache so a later forward can detach the bytes. Never awaited.
+-private func hboltPrefetchMedia(account: Account, message: Message, media: Media) {
+-    guard let (resource, contentType, _) = hboltResourceForReupload(media) else {
+-        return
++/// The single clean conversion: strip ALL forwarding provenance and rebuild the source message as
++/// a brand-new standalone outgoing message. Returns nil when the message carries media that is not
++/// yet on disk, so the caller can download-then-send instead of dispatching a broken empty message.
++private func hboltConvertForward(account: Account, message: Message, threadId: Int64?, attributes: [MessageAttribute], correlationId: Int64?, localGroupingKey: Int64?, viewOnce: Bool) -> EnqueueMessage? {
++    // Never carry forwarding/source provenance: the server must see a plain new message from us.
++    var outAttributes: [MessageAttribute] = attributes.filter { attr in
++        !(attr is SourceReferenceMessageAttribute)
++            && !(attr is ForwardCountMessageAttribute)
++            && !(attr is TextEntitiesMessageAttribute)
++            && !(attr is AutoremoveTimeoutMessageAttribute)
+     }
+-    let fetch = fetchedMediaResource(mediaBox: account.postbox.mediaBox, userLocation: .peer(message.id.peerId), userContentType: contentType, reference: .media(media: .message(message: MessageReference(message), media: media), resource: resource))
+-    |> ignoreValues
+-    |> `catch` { _ -> Signal<Never, NoError> in .complete() }
+-    hboltPrefetchDisposables.add(fetch.start())
+-}
+-
+-/// Turns `.forward` of protected content into `.message`. Fully synchronous: if the media is
+-/// cached it is detached into fresh local bytes and sent now; if not, a background prefetch is
+-/// kicked off and the caption/text is sent immediately. Never blocks the enqueue pipeline.
+-private func hboltResend(account: Account, message: Message, threadId: Int64?, grouping: EnqueueMessageGrouping, attributes: [MessageAttribute], correlationId: Int64?, groupingKeys: [Int64: Int64], viewOnce: Bool = false, forcedGroupingKey: Int64? = nil) -> Signal<EnqueueMessage, NoError> {
+-    var copiedAttributes: [MessageAttribute] = attributes.filter { !($0 is TextEntitiesMessageAttribute) && !($0 is AutoremoveTimeoutMessageAttribute) }
+     if let entities = message.attributes.first(where: { $0 is TextEntitiesMessageAttribute }) {
+-        copiedAttributes.append(entities)
++        outAttributes.append(entities)
+     }
+     if viewOnce {
+-        copiedAttributes.append(AutoremoveTimeoutMessageAttribute(timeout: viewOnceTimeout, countdownBeginTime: nil))
++        outAttributes.append(AutoremoveTimeoutMessageAttribute(timeout: viewOnceTimeout, countdownBeginTime: nil))
++    }
++
++    if let media = message.media.first(where: { $0 is TelegramMediaImage || $0 is TelegramMediaFile }) {
++        guard let detached = hboltDetachMediaIfCached(account: account, media: media) else {
++            return nil
++        }
++        return .message(text: message.text, attributes: outAttributes, inlineStickers: [:], mediaReference: .standalone(media: detached), threadId: threadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: localGroupingKey, correlationId: correlationId, bubbleUpEmojiOrStickersets: [])
++    } else {
++        // No re-uploadable media — send the text alone. Never dispatch a truly empty message.
++        if message.text.isEmpty {
++            return nil
++        }
++        return .message(text: message.text, attributes: outAttributes, inlineStickers: [:], mediaReference: nil, threadId: threadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: localGroupingKey, correlationId: correlationId, bubbleUpEmojiOrStickersets: [])
+     }
+-    var localGroupingKey: Int64?
+-    if let forcedGroupingKey = forcedGroupingKey {
+-        localGroupingKey = forcedGroupingKey
+-    } else if case .auto = grouping, let key = message.groupingKey {
+-        localGroupingKey = groupingKeys[key]
++}
++
++/// Media wasn't cached at forward time: download it (off the enqueue path, so nothing is blocked),
++/// then convert and send when the bytes are on disk. Bounded; gives up quietly rather than ever
++/// dispatching a broken message.
++private func hboltDownloadThenSend(account: Account, peerId: PeerId, message: Message, threadId: Int64?, attributes: [MessageAttribute], correlationId: Int64?, localGroupingKey: Int64?, viewOnce: Bool) {
++    guard let media = message.media.first(where: { $0 is TelegramMediaImage || $0 is TelegramMediaFile }), let (resource, contentType, _) = hboltResourceForReupload(media) else {
++        return
+     }
++    let mediaBox = account.postbox.mediaBox
++    let fetch: Signal<Never, NoError> = fetchedMediaResource(mediaBox: mediaBox, userLocation: .peer(message.id.peerId), userContentType: contentType, reference: .media(media: .message(message: MessageReference(message), media: media), resource: resource))
++    |> ignoreValues
++    |> `catch` { _ -> Signal<Never, NoError> in .complete() }
++
++    let ready = mediaBox.resourceData(resource, option: .complete(waitUntilFetchStatus: false))
++    |> filter { $0.complete }
++    |> take(1)
++    |> map { _ in Void() }
+ 
+-    let build: (AnyMediaReference?) -> EnqueueMessage = { mediaReference in
+-        return .message(text: message.text, attributes: copiedAttributes, inlineStickers: [:], mediaReference: mediaReference, threadId: threadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: localGroupingKey, correlationId: correlationId, bubbleUpEmojiOrStickersets: [])
++    let waitForData = Signal<Void, NoError> { subscriber in
++        let fetchDisposable = fetch.start()
++        let dataDisposable = ready.start(next: { _ in
++            subscriber.putNext(Void())
++            subscriber.putCompletion()
++        })
++        return ActionDisposable {
++            fetchDisposable.dispose()
++            dataDisposable.dispose()
++        }
+     }
++    |> timeout(180.0, queue: Queue.concurrentDefaultQueue(), alternate: .complete())
+ 
+-    for media in message.media {
+-        guard media is TelegramMediaImage || media is TelegramMediaFile else { continue }
+-        if let detached = hboltDetachMediaIfCached(account: account, message: message, media: media) {
+-            return .single(build(.standalone(media: detached)))
+-        } else {
+-            hboltPrefetchMedia(account: account, message: message, media: media)
+-            return .single(build(nil))
++    let send = waitForData
++    |> mapToSignal { _ -> Signal<[MessageId?], NoError> in
++        guard let converted = hboltConvertForward(account: account, message: message, threadId: threadId, attributes: attributes, correlationId: correlationId, localGroupingKey: localGroupingKey, viewOnce: viewOnce) else {
++            return .single([])
+         }
++        return enqueueMessages(account: account, peerId: peerId, messages: [converted])
+     }
+-    return .single(build(nil))
++    hboltDeferredSends.add(send.start())
+ }
+ 
+-func hboltRewriteProtectedForwards(account: Account, messages: [EnqueueMessage]) -> Signal<[EnqueueMessage], NoError> {
+-    if !HBOLTSettings.protectedForward {
++/// HBOLT: re-send forwards from protected (noforwards) chats as fresh standalone messages.
++/// Synchronous for the batch it returns — cached media and text go out immediately; media that
++/// isn't cached is downloaded and sent asynchronously (omitted from this batch) so nothing broken
++/// is dispatched and the enqueue pipeline never blocks. Non-protected items pass through unchanged.
++func hboltRewriteProtectedForwards(account: Account, peerId: PeerId, messages: [EnqueueMessage]) -> Signal<[EnqueueMessage], NoError> {
++    guard HBOLTSettings.protectedForward else {
+         return .single(messages)
+     }
+-    let hasProtected = messages.contains(where: { item in
++    let hasProtected = messages.contains { item in
+         if case let .forward(source, _, _, _, _) = item {
+             return HBOLTSettings.isProtected(source.peerId.toInt64())
+         }
+         return false
+-    })
++    }
+     if !hasProtected {
+         return .single(messages)
+     }
+@@ -156,26 +188,31 @@ func hboltRewriteProtectedForwards(account: Account, messages: [EnqueueMessage])
+             return nil
+         }
+     }
+-    |> mapToSignal { sources -> Signal<[EnqueueMessage], NoError> in
++    |> map { sources -> [EnqueueMessage] in
++        // Shared album grouping keys for protected sources that were themselves an album.
+         var groupingKeys: [Int64: Int64] = [:]
+         for source in sources {
+             if let key = source?.groupingKey, groupingKeys[key] == nil {
+                 groupingKeys[key] = Int64.random(in: Int64.min ... Int64.max)
+             }
+         }
+-        var signals: [Signal<EnqueueMessage, NoError>] = []
++        var result: [EnqueueMessage] = []
+         for (index, item) in messages.enumerated() {
+-            if case let .forward(_, threadId, grouping, attributes, correlationId) = item, let source = sources[index] {
+-                signals.append(hboltResend(account: account, message: source, threadId: threadId, grouping: grouping, attributes: attributes, correlationId: correlationId, groupingKeys: groupingKeys))
++            guard case let .forward(_, threadId, _, attributes, correlationId) = item, let source = sources[index] else {
++                result.append(item)
++                continue
++            }
++            let localGroupingKey = source.groupingKey.flatMap { groupingKeys[$0] }
++            if let converted = hboltConvertForward(account: account, message: source, threadId: threadId, attributes: attributes, correlationId: correlationId, localGroupingKey: localGroupingKey, viewOnce: false) {
++                result.append(converted)
+             } else {
+-                signals.append(.single(item))
++                hboltDownloadThenSend(account: account, peerId: peerId, message: source, threadId: threadId, attributes: attributes, correlationId: correlationId, localGroupingKey: localGroupingKey, viewOnce: false)
+             }
+         }
+-        return combineLatest(signals)
++        return result
+     }
+ }
+ 
+-
+ public extension HBOLTSettings {
+     /// When forwarding a single photo/video into a private chat, re-upload it as view-once.
+     static var viewOnceToPrivate: Bool { return value("hbolt.viewOnceToPrivate") }
+@@ -217,7 +254,7 @@ func hboltRewriteGroupAlbums(account: Account, peerId: PeerId, messages: [Enqueu
+             return nil
+         }
+     }
+-    |> mapToSignal { sources -> Signal<[EnqueueMessage], NoError> in
++    |> map { sources -> [EnqueueMessage] in
+         var mediaIndices: [Int] = []
+         for (index, item) in messages.enumerated() {
+             if case .forward = item, let source = sources[index], hboltIsAlbumableMedia(source) {
+@@ -225,7 +262,7 @@ func hboltRewriteGroupAlbums(account: Account, peerId: PeerId, messages: [Enqueu
+             }
+         }
+         if mediaIndices.count < 2 {
+-            return .single(messages)
++            return messages
+         }
+         var keyForIndex: [Int: Int64] = [:]
+         var g = 0
+@@ -239,15 +276,20 @@ func hboltRewriteGroupAlbums(account: Account, peerId: PeerId, messages: [Enqueu
+             }
+             g += 10
+         }
+-        var signals: [Signal<EnqueueMessage, NoError>] = []
++        var result: [EnqueueMessage] = []
+         for (index, item) in messages.enumerated() {
+             if let key = keyForIndex[index], case let .forward(_, threadId, _, attributes, correlationId) = item, let source = sources[index] {
+-                signals.append(hboltResend(account: account, message: source, threadId: threadId, grouping: .none, attributes: attributes, correlationId: correlationId, groupingKeys: [:], forcedGroupingKey: key))
++                if let converted = hboltConvertForward(account: account, message: source, threadId: threadId, attributes: attributes, correlationId: correlationId, localGroupingKey: key, viewOnce: false) {
++                    result.append(converted)
++                } else {
++                    // Not cached yet — fall back to the native forward for this item.
++                    result.append(item)
++                }
+             } else {
+-                signals.append(.single(item))
++                result.append(item)
+             }
+         }
+-        return combineLatest(signals)
++        return result
+     }
+ }
+ 
+@@ -269,16 +311,20 @@ func hboltRewriteViewOnce(account: Account, peerId: PeerId, messages: [EnqueueMe
+             return nil
+         }
+     }
+-    |> mapToSignal { sources -> Signal<[EnqueueMessage], NoError> in
+-        var signals: [Signal<EnqueueMessage, NoError>] = []
++    |> map { sources -> [EnqueueMessage] in
++        var result: [EnqueueMessage] = []
+         for (index, item) in messages.enumerated() {
+             if case let .forward(_, threadId, _, attributes, correlationId) = item, let source = sources[index], hboltIsSingleVisualMedia(source) {
+-                signals.append(hboltResend(account: account, message: source, threadId: threadId, grouping: .none, attributes: attributes, correlationId: correlationId, groupingKeys: [:], viewOnce: true))
++                if let converted = hboltConvertForward(account: account, message: source, threadId: threadId, attributes: attributes, correlationId: correlationId, localGroupingKey: nil, viewOnce: true) {
++                    result.append(converted)
++                } else {
++                    result.append(item)
++                }
+             } else {
+-                signals.append(.single(item))
++                result.append(item)
+             }
+         }
+-        return combineLatest(signals)
++        return result
+     }
+ }
+ 
+diff --git a/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift b/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
+index 92cd02fd5..7bc489643 100644
+--- a/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
++++ b/submodules/TelegramCore/Sources/PendingMessages/EnqueueMessage.swift
+@@ -708,7 +708,7 @@ private func hboltEnqueueAfterViewOnce(account: Account, peerId: PeerId, message
+     // HBOLT: forwards go through Telegram's native send queue, which paces sends, respects
+     // FLOOD_WAIT, retries, and keeps albums grouped. (Earlier manual 10-item chunking split
+     // albums across batches and could drop forwards, so it was removed.)
+-    return hboltRewriteProtectedForwards(account: account, messages: messages)
++    return hboltRewriteProtectedForwards(account: account, peerId: peerId, messages: messages)
+     |> mapToSignal { messages -> Signal<[MessageId?], NoError> in
+         return hboltEnqueueMessagesImpl(account: account, peerId: peerId, messages: messages)
+     }
