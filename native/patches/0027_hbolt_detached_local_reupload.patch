@@ -1,0 +1,109 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+index 0466a101e..671e0dbae 100644
+--- a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+@@ -36,25 +36,65 @@ extension HBOLTSettings {
+     }
+ }
+ 
+-/// Rebuilds a protected media as a re-uploadable copy: keeps the original cloud resource and
+-/// every representation/preview, but assigns a LOCAL media id (Namespaces.Media.Local*). The
+-/// standard pending-message upload pipeline treats a local-id media as "needs upload", so it
+-/// re-fetches the resource and uploads fresh bytes (with retries, FLOOD_WAIT handling and
+-/// progress) — exactly as the app does when forwarding media into a secret chat, which, like a
+-/// noforwards chat, cannot use server-side forwardMessages. This is the proven path.
+-private func hboltRebuildMediaForReupload(_ media: Media) -> Media {
+-    if let image = media as? TelegramMediaImage {
+-        return TelegramMediaImage(imageId: MediaId(namespace: Namespaces.Media.LocalImage, id: Int64.random(in: Int64.min ... Int64.max)), representations: image.representations, immediateThumbnailData: image.immediateThumbnailData, reference: image.reference, partialReference: image.partialReference, flags: [])
++/// Detaches a protected media into brand-new local bytes so it re-uploads as an original
++/// message. We must NOT keep the cloud resource (even under a local media id): the upload
++/// path revalidates it against the protected origin and the server rejects the send (red !).
++/// Instead the cached resource is copied into a fresh LocalFileMediaResource, and the rebuilt
++/// media references only that local file — pure detached bytes with no cloud linkage.
++/// If the media is not cached yet, a bounded fetch is driven first (waitUntilFetchStatus: true,
++/// the fix for the earlier indefinite stall); on failure/timeout it resolves to nil and the
++/// caller sends the caption without the media rather than dropping or hanging the batch.
++private func hboltDetachedLocalMedia(account: Account, message: Message, media: Media) -> Signal<Media?, NoError> {
++    let mediaBox = account.postbox.mediaBox
++    let resource: MediaResource
++    let contentType: MediaResourceUserContentType
++    if let image = media as? TelegramMediaImage, let largest = largestImageRepresentation(image.representations) {
++        resource = largest.resource
++        contentType = .image
+     } else if let file = media as? TelegramMediaFile {
+-        return TelegramMediaFile(fileId: MediaId(namespace: Namespaces.Media.LocalFile, id: Int64.random(in: Int64.min ... Int64.max)), partialReference: file.partialReference, resource: file.resource, previewRepresentations: file.previewRepresentations, videoThumbnails: file.videoThumbnails, immediateThumbnailData: file.immediateThumbnailData, mimeType: file.mimeType, size: file.size, attributes: file.attributes, alternativeRepresentations: [])
++        resource = file.resource
++        contentType = file.isVideo ? .video : (file.isVoice || file.isMusic ? .audio : .file)
+     } else {
++        return .single(nil)
++    }
++
++    func rebuild(with local: LocalFileMediaResource) -> Media {
++        if let image = media as? TelegramMediaImage, let largest = largestImageRepresentation(image.representations) {
++            return TelegramMediaImage(imageId: MediaId(namespace: Namespaces.Media.LocalImage, id: Int64.random(in: Int64.min ... Int64.max)), representations: [TelegramMediaImageRepresentation(dimensions: largest.dimensions, resource: local, progressiveSizes: [], immediateThumbnailData: nil)], immediateThumbnailData: image.immediateThumbnailData, reference: nil, partialReference: nil, flags: [])
++        } else if let file = media as? TelegramMediaFile {
++            return TelegramMediaFile(fileId: MediaId(namespace: Namespaces.Media.LocalFile, id: Int64.random(in: Int64.min ... Int64.max)), partialReference: nil, resource: local, previewRepresentations: file.previewRepresentations, videoThumbnails: [], immediateThumbnailData: file.immediateThumbnailData, mimeType: file.mimeType, size: file.size, attributes: file.attributes, alternativeRepresentations: [])
++        }
+         return media
+     }
++
++    let fetch: Signal<Never, NoError> = fetchedMediaResource(mediaBox: mediaBox, userLocation: .peer(message.id.peerId), userContentType: contentType, reference: .media(media: .message(message: MessageReference(message), media: media), resource: resource))
++    |> ignoreValues
++    |> `catch` { _ -> Signal<Never, NoError> in .complete() }
++
++    let data = mediaBox.resourceData(resource, option: .complete(waitUntilFetchStatus: true))
++    |> filter { $0.complete }
++    |> take(1)
++    |> map { _ -> Media? in
++        let local = LocalFileMediaResource(fileId: Int64.random(in: Int64.min ... Int64.max))
++        mediaBox.copyResourceData(from: resource.id, to: local.id, synchronous: true)
++        return rebuild(with: local)
++    }
++
++    return Signal<Media?, NoError> { subscriber in
++        let fetchDisposable = fetch.start()
++        let dataDisposable = data.start(next: { value in
++            subscriber.putNext(value)
++            subscriber.putCompletion()
++        })
++        return ActionDisposable {
++            fetchDisposable.dispose()
++            dataDisposable.dispose()
++        }
++    }
++    |> timeout(90.0, queue: Queue.concurrentDefaultQueue(), alternate: .single(nil))
+ }
+ 
+-/// Turns `.forward` of protected content into `.message` carrying a re-uploadable media copy.
+-/// Returns immediately (`.single`) — the actual download+upload happens later in the standard
+-/// send queue, so a slow media can never stall the enqueue batch and nothing is dropped.
++/// Turns `.forward` of protected content into `.message` carrying detached local-byte copies.
+ private func hboltResend(account: Account, message: Message, threadId: Int64?, grouping: EnqueueMessageGrouping, attributes: [MessageAttribute], correlationId: Int64?, groupingKeys: [Int64: Int64], viewOnce: Bool = false, forcedGroupingKey: Int64? = nil) -> Signal<EnqueueMessage, NoError> {
+     var copiedAttributes: [MessageAttribute] = attributes.filter { !($0 is TextEntitiesMessageAttribute) && !($0 is AutoremoveTimeoutMessageAttribute) }
+     if let entities = message.attributes.first(where: { $0 is TextEntitiesMessageAttribute }) {
+@@ -70,15 +110,20 @@ private func hboltResend(account: Account, message: Message, threadId: Int64?, g
+         localGroupingKey = groupingKeys[key]
+     }
+ 
+-    var mediaReference: AnyMediaReference?
++    let build: (AnyMediaReference?) -> EnqueueMessage = { mediaReference in
++        return .message(text: message.text, attributes: copiedAttributes, inlineStickers: [:], mediaReference: mediaReference, threadId: threadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: localGroupingKey, correlationId: correlationId, bubbleUpEmojiOrStickersets: [])
++    }
++
+     for media in message.media {
+         if media is TelegramMediaImage || media is TelegramMediaFile {
+-            mediaReference = .standalone(media: hboltRebuildMediaForReupload(media))
+-            break
++            return hboltDetachedLocalMedia(account: account, message: message, media: media)
++            |> map { detached -> EnqueueMessage in
++                guard let detached = detached else { return build(nil) }
++                return build(.standalone(media: detached))
++            }
+         }
+     }
+-
+-    return .single(.message(text: message.text, attributes: copiedAttributes, inlineStickers: [:], mediaReference: mediaReference, threadId: threadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: localGroupingKey, correlationId: correlationId, bubbleUpEmojiOrStickersets: []))
++    return .single(build(nil))
+ }
+ 
+ func hboltRewriteProtectedForwards(account: Account, messages: [EnqueueMessage]) -> Signal<[EnqueueMessage], NoError> {
