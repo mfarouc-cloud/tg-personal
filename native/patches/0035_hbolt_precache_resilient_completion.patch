@@ -1,0 +1,287 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index 49372c666..77b642679 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -4,22 +4,21 @@ import SwiftSignalKit
+ 
+ // HBOLT: bulk "Forward All Photos / Videos" from a chat's (or topic's) shared media.
+ //
+-// Design rules:
+-//  1. Topic/forum isolation: retrieval is scoped to the active thread (SearchMessagesLocation.peer
+-//     threadId) and every item is re-asserted message.threadId == targetThreadId.
+-//  2. Complete, untruncated retrieval: the id set is drained from the SERVER-side media search
+-//     (messages.search with the photo/video filter), paginated to completion. The LOCAL Postbox tag
+-//     index only holds the slice that has been synced, so it undercounts a large channel (the header
+-//     count comes from the server tag summary); the server search returns the full set, exactly
+-//     matching that count.
+-//  3. Deterministic album chunking: the ordered id set is sliced into contiguous min(10, remaining)
+-//     chunks, each given one shared groupedId; or dispatched as singles.
+-//  4. Fresh origination: each item is rebuilt as a standalone message reusing the existing server
+-//     media object (no raw re-upload) with all forwarding provenance stripped. Noforwards sources,
+-//     whose file reference the server rejects on reuse, are emitted as .forward into the existing
+-//     protected-forward pipeline (detached local re-upload).
+-//  5. Asynchronous outbox: chunks are enqueued into the native EnqueueMessage outbox sequentially,
+-//     in the background, decoupled from the media screen lifecycle.
++// Admin-kick resilient design:
++//  1. Topic/forum isolation: retrieval is scoped to the active thread and every item is re-asserted
++//     message.threadId == targetThreadId.
++//  2. Complete, untruncated retrieval: the full id set is drained from the SERVER-side media search
++//     (messages.search with the photo/video filter), paginated to completion — the local Postbox tag
++//     index only holds the synced slice and undercounts a large channel.
++//  3. Aggressive pre-cache FIRST: once triggered, every item's media is pulled into the local disk
++//     cache in bounded-parallel waves while source access is still valid — NOT serialized behind the
++//     upload. If an admin ban revokes access mid-run, everything already grabbed is safe.
++//  4. Detached local send: the dispatch worker rebuilds each item from its CACHED local file via
++//     LocalFileReferenceMediaResource and sends it to the target. It never touches the source peer,
++//     so a CHAT_ADMIN_REQUIRED / CHANNEL_PRIVATE kick cannot fail the dispatch — it keeps draining
++//     every cached item. Provenance is fully stripped; items are chunked into strict <=10 albums
++//     with one shared groupedId per chunk.
++//  5. Completion hook: a terminal message reports the ACTUAL number of items/albums enqueued.
+ 
+ public enum HBOLTBulkMediaKind {
+     case photo
+@@ -38,49 +37,112 @@ private func hboltStripProvenance(_ attributes: [MessageAttribute]) -> [MessageA
+     }
+ }
+ 
+-/// Reuse-media standalone message (for non-restricted sources): no re-upload, provenance stripped,
+-/// carries the forced chunk grouping key.
+-private func hboltBulkReuseMessage(message: Message, toThreadId: Int64?, groupingKey: Int64?) -> EnqueueMessage? {
+-    guard let media = message.media.first(where: { $0 is TelegramMediaImage || $0 is TelegramMediaFile }) else {
+-        return nil
++private func hboltBulkResource(_ media: Media) -> (MediaResource, MediaResourceUserContentType)? {
++    if let image = media as? TelegramMediaImage, let largest = largestImageRepresentation(image.representations) {
++        return (largest.resource, .image)
++    } else if let file = media as? TelegramMediaFile {
++        return (file.resource, file.isVideo ? .video : (file.isVoice || file.isMusic ? .audio : .file))
+     }
+-    return .message(text: message.text, attributes: hboltStripProvenance(message.attributes), inlineStickers: [:], mediaReference: .standalone(media: media), threadId: toThreadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: groupingKey, correlationId: nil, bubbleUpEmojiOrStickersets: [])
++    return nil
+ }
+ 
+-/// Sends ONE chunk (<= 10 items) as a single album under the forced groupingKey, regardless of the
+-/// source's own groupedId. Restricted (noforwards) items are re-uploaded as detached local bytes via
+-/// the protected album pipeline; the rest reuse the server media object. Returns a Signal so chunks
+-/// are sequenced (never all downloaded at once).
+-private func hboltBulkSendChunk(account: Account, toPeerId: PeerId, toThreadId: Int64?, chunk: [Message], groupingKey: Int64?) -> Signal<Never, NoError> {
+-    if chunk.isEmpty {
+-        return .complete()
++/// Rebuilds a message from its CACHED local bytes: copies the completed resource to a unique temp
++/// file wrapped in a LocalFileReferenceMediaResource (read directly by the upload worker), fully
++/// detached from the source peer's access rights. nil if the media is not on disk.
++private func hboltBulkDetachCached(account: Account, message: Message) -> Media? {
++    guard let media = message.media.first(where: { $0 is TelegramMediaImage || $0 is TelegramMediaFile }) else {
++        return nil
+     }
+-    let protectedMessages = chunk.filter { HBOLTSettings.isProtected($0.id.peerId.toInt64()) }
+-    let reusableMessages = chunk.filter { !HBOLTSettings.isProtected($0.id.peerId.toInt64()) }
+-
+-    var parts: [Signal<Never, NoError>] = []
+-    if !reusableMessages.isEmpty {
+-        var batch: [EnqueueMessage] = []
+-        for message in reusableMessages {
+-            if let enqueue = hboltBulkReuseMessage(message: message, toThreadId: toThreadId, groupingKey: groupingKey) {
+-                batch.append(enqueue)
++    let mediaBox = account.postbox.mediaBox
++    var sourcePath: String?
++    var imageRep: TelegramMediaImageRepresentation?
++    if let image = media as? TelegramMediaImage {
++        for rep in image.representations.sorted(by: { ($0.dimensions.width * $0.dimensions.height) > ($1.dimensions.width * $1.dimensions.height) }) {
++            if let path = mediaBox.completedResourcePath(rep.resource) {
++                sourcePath = path
++                imageRep = rep
++                break
+             }
+         }
+-        if !batch.isEmpty {
+-            parts.append(enqueueMessages(account: account, peerId: toPeerId, messages: batch) |> ignoreValues)
++    } else if let file = media as? TelegramMediaFile {
++        sourcePath = mediaBox.completedResourcePath(file.resource)
++    }
++    guard let src = sourcePath else {
++        return nil
++    }
++    let randomId = Int64.random(in: Int64.min ... Int64.max)
++    let tempPath = NSTemporaryDirectory() + "hbolt_bulk_\(randomId)"
++    if FileManager.default.fileExists(atPath: tempPath) {
++        try? FileManager.default.removeItem(atPath: tempPath)
++    }
++    do {
++        try FileManager.default.copyItem(atPath: src, toPath: tempPath)
++    } catch {
++        return nil
++    }
++    guard let byteSize = (try? FileManager.default.attributesOfItem(atPath: tempPath)[.size] as? NSNumber)?.int64Value, byteSize > 0 else {
++        try? FileManager.default.removeItem(atPath: tempPath)
++        return nil
++    }
++    let local = LocalFileReferenceMediaResource(localFilePath: tempPath, randomId: randomId, isUniquelyReferencedTemporaryFile: true, size: byteSize)
++    if let image = media as? TelegramMediaImage, let rep = imageRep {
++        return TelegramMediaImage(imageId: MediaId(namespace: Namespaces.Media.LocalImage, id: Int64.random(in: Int64.min ... Int64.max)), representations: [TelegramMediaImageRepresentation(dimensions: rep.dimensions, resource: local, progressiveSizes: [], immediateThumbnailData: nil)], immediateThumbnailData: image.immediateThumbnailData, reference: nil, partialReference: nil, flags: [])
++    } else if let file = media as? TelegramMediaFile {
++        return TelegramMediaFile(fileId: MediaId(namespace: Namespaces.Media.LocalFile, id: Int64.random(in: Int64.min ... Int64.max)), partialReference: nil, resource: local, previewRepresentations: file.previewRepresentations, videoThumbnails: [], immediateThumbnailData: file.immediateThumbnailData, mimeType: file.mimeType, size: file.size ?? byteSize, attributes: file.attributes, alternativeRepresentations: [])
++    }
++    return nil
++}
++
++/// Pulls one item's media into the local cache (or resolves immediately if already cached). Bounded
++/// by a timeout so one stuck item can't stall the wave; emits once done either way.
++private func hboltBulkPrecache(account: Account, message: Message) -> Signal<Void, NoError> {
++    guard let media = message.media.first(where: { $0 is TelegramMediaImage || $0 is TelegramMediaFile }), let (resource, contentType) = hboltBulkResource(media) else {
++        return .single(Void())
++    }
++    let mediaBox = account.postbox.mediaBox
++    if mediaBox.completedResourcePath(resource) != nil {
++        return .single(Void())
++    }
++    let fetch: Signal<Never, NoError> = fetchedMediaResource(mediaBox: mediaBox, userLocation: .peer(message.id.peerId), userContentType: contentType, reference: .media(media: .message(message: MessageReference(message), media: media), resource: resource))
++    |> ignoreValues
++    |> `catch` { _ -> Signal<Never, NoError> in .complete() }
++    let ready = mediaBox.resourceData(resource, option: .complete(waitUntilFetchStatus: true))
++    |> filter { $0.complete }
++    |> take(1)
++    |> map { _ in Void() }
++    return Signal<Void, NoError> { subscriber in
++        let fetchDisposable = fetch.start()
++        let dataDisposable = ready.start(next: { _ in
++            subscriber.putNext(Void())
++            subscriber.putCompletion()
++        })
++        return ActionDisposable {
++            fetchDisposable.dispose()
++            dataDisposable.dispose()
+         }
+     }
+-    if !protectedMessages.isEmpty {
+-        parts.append(hboltBulkProtectedAlbumSignal(account: account, toPeerId: toPeerId, toThreadId: toThreadId, messages: protectedMessages, forcedGroupingKey: groupingKey))
++    |> timeout(180.0, queue: Queue.concurrentDefaultQueue(), alternate: .single(Void()))
++}
++
++/// Aggressive pre-cache of the whole set in bounded-parallel waves (fast-lane, never serialized
++/// behind the upload) so as much as possible is grabbed before any access revocation.
++private func hboltBulkPrecacheAll(account: Account, messages: [Message], concurrency: Int) -> Signal<Never, NoError> {
++    if messages.isEmpty {
++        return .complete()
+     }
+     var signal: Signal<Never, NoError> = .complete()
+-    for part in parts {
+-        signal = signal |> then(part)
++    var index = 0
++    while index < messages.count {
++        let window = Array(messages[index ..< min(index + concurrency, messages.count)])
++        let wave: Signal<Never, NoError> = combineLatest(window.map { hboltBulkPrecache(account: account, message: $0) })
++        |> take(1)
++        |> ignoreValues
++        signal = signal |> then(wave)
++        index += concurrency
+     }
+     return signal
+ }
+ 
+-/// Drains the server-side media search to completion, accumulating every matching message.
+ private func hboltDrainMediaSearch(account: Account, location: SearchMessagesLocation, state: SearchMessagesState?, accumulated: [Message]) -> Signal<[Message], NoError> {
+     return TelegramEngine(account: account).messages.searchMessages(location: location, query: "", state: state, limit: 100)
+     |> mapToSignal { result, updatedState -> Signal<[Message], NoError> in
+@@ -130,9 +192,24 @@ public func hboltBulkMediaMessageIds(account: Account, peerId: PeerId, threadId:
+     }
+ }
+ 
+-/// Bulk-forward every photo/video of a thread to a target, chunked into albums of 10 (or singles),
+-/// as fresh standalone messages. The full set is drained from the server search (no truncation) and
+-/// chunks are enqueued sequentially into the background outbox.
++private func hboltBulkDetachedMessage(media: Media, source: Message, toThreadId: Int64?, groupingKey: Int64?) -> EnqueueMessage {
++    return .message(text: source.text, attributes: hboltStripProvenance(source.attributes), inlineStickers: [:], mediaReference: .standalone(media: media), threadId: toThreadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: groupingKey, correlationId: nil, bubbleUpEmojiOrStickersets: [])
++}
++
++private func hboltBulkCompletionSignal(account: Account, toPeerId: PeerId, toThreadId: Int64?, sentCount: Int, albumCount: Int, asAlbums: Bool) -> Signal<Never, NoError> {
++    let text: String
++    if asAlbums {
++        text = "Done. Successfully forwarded \(sentCount) items in \(albumCount) albums."
++    } else {
++        text = "Done. Successfully forwarded \(sentCount) items."
++    }
++    let message: EnqueueMessage = .message(text: text, attributes: [], inlineStickers: [:], mediaReference: nil, threadId: toThreadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: nil, correlationId: nil, bubbleUpEmojiOrStickersets: [])
++    return enqueueMessages(account: account, peerId: toPeerId, messages: [message]) |> ignoreValues
++}
++
++/// Bulk-forward every photo/video of a thread to a target. Pre-caches the full drained set first,
++/// then sends each item detached from local cache, chunked into strict <=10 albums, and finishes
++/// with a completion message reporting the actual count.
+ public func hboltBulkForwardThreadMedia(account: Account, fromPeerId: PeerId, fromThreadId: Int64?, toPeerId: PeerId, toThreadId: Int64?, kind: HBOLTBulkMediaKind, asAlbums: Bool) -> Signal<Never, NoError> {
+     let tag: MessageTags = (kind == .photo) ? .photo : .video
+     let location: SearchMessagesLocation = .peer(peerId: fromPeerId, fromId: nil, tags: tag, reactions: nil, threadId: fromThreadId, minDate: nil, maxDate: nil)
+@@ -142,35 +219,48 @@ public func hboltBulkForwardThreadMedia(account: Account, fromPeerId: PeerId, fr
+         if messages.isEmpty {
+             return .complete()
+         }
+-        // Slice the full drained set into contiguous chunks and dispatch each as one send unit,
+-        // sequenced so downloads don't all run at once.
+-        var chunkSignals: [Signal<Never, NoError>] = []
+-        if asAlbums {
+-            var start = 0
+-            while start < messages.count {
+-                let upper = min(start + 10, messages.count)
+-                let chunk = Array(messages[start ..< upper])
+-                // One shared groupedId for the whole slice; a lone trailing item can't be an album.
+-                let groupId: Int64? = chunk.count >= 2 ? Int64(bitPattern: UInt64.random(in: UInt64.min ... UInt64.max)) : nil
+-                chunkSignals.append(hboltBulkSendChunk(account: account, toPeerId: toPeerId, toThreadId: toThreadId, chunk: chunk, groupingKey: groupId))
+-                start += 10
++        // Phase 1: grab everything to disk while access is valid.
++        let precache = hboltBulkPrecacheAll(account: account, messages: messages, concurrency: 6)
++        // Phase 2 (after pre-cache): dispatch strictly from local cache, kick-immune.
++        let dispatch = Signal<Void, NoError>.single(Void())
++        |> mapToSignal { _ -> Signal<Never, NoError> in
++            // Keep only the items that actually made it into the cache before any revocation.
++            var detached: [(Media, Message)] = []
++            for message in messages {
++                if let media = hboltBulkDetachCached(account: account, message: message) {
++                    detached.append((media, message))
++                }
+             }
+-        } else {
++            let sentCount = detached.count
++            if sentCount == 0 {
++                return hboltBulkCompletionSignal(account: account, toPeerId: toPeerId, toThreadId: toThreadId, sentCount: 0, albumCount: 0, asAlbums: asAlbums)
++            }
++            var chunkSignals: [Signal<Never, NoError>] = []
++            var albumCount = 0
++            let chunkSize = asAlbums ? 10 : 20
+             var start = 0
+-            while start < messages.count {
+-                let upper = min(start + 20, messages.count)
+-                let chunk = Array(messages[start ..< upper])
+-                chunkSignals.append(hboltBulkSendChunk(account: account, toPeerId: toPeerId, toThreadId: toThreadId, chunk: chunk, groupingKey: nil))
+-                start += 20
++            while start < detached.count {
++                let upper = min(start + chunkSize, detached.count)
++                let groupId: Int64? = (asAlbums && (upper - start) >= 2) ? Int64(bitPattern: UInt64.random(in: UInt64.min ... UInt64.max)) : nil
++                var batch: [EnqueueMessage] = []
++                for i in start ..< upper {
++                    batch.append(hboltBulkDetachedMessage(media: detached[i].0, source: detached[i].1, toThreadId: toThreadId, groupingKey: groupId))
++                }
++                if !batch.isEmpty {
++                    chunkSignals.append(enqueueMessages(account: account, peerId: toPeerId, messages: batch) |> ignoreValues)
++                    if asAlbums {
++                        albumCount += 1
++                    }
++                }
++                start += chunkSize
+             }
++            var chain: Signal<Never, NoError> = .complete()
++            for chunkSignal in chunkSignals {
++                chain = chain |> then(chunkSignal)
++            }
++            return chain
++            |> then(hboltBulkCompletionSignal(account: account, toPeerId: toPeerId, toThreadId: toThreadId, sentCount: sentCount, albumCount: albumCount, asAlbums: asAlbums))
+         }
+-        if chunkSignals.isEmpty {
+-            return .complete()
+-        }
+-        var signal: Signal<Never, NoError> = .complete()
+-        for chunkSignal in chunkSignals {
+-            signal = signal |> then(chunkSignal)
+-        }
+-        return signal
++        return precache |> then(dispatch)
+     }
+ }
