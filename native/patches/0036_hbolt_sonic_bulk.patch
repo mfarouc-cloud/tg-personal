@@ -1,0 +1,171 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index 77b642679..cecbbd95d 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -264,3 +264,121 @@ public func hboltBulkForwardThreadMedia(account: Account, fromPeerId: PeerId, fr
+         return precache |> then(dispatch)
+     }
+ }
++
++// MARK: - Sonic Bulk (Auto-Albums): isolated producer-consumer fast-lane with per-chunk eviction.
++
++private func hboltSonicResourceId(_ message: Message) -> MediaResourceId? {
++    guard let media = message.media.first(where: { $0 is TelegramMediaImage || $0 is TelegramMediaFile }) else {
++        return nil
++    }
++    return hboltBulkResource(media)?.0.id
++}
++
++/// Accepts BOTH photos and videos (Sonic forwards all media), deduped and chronological.
++private func hboltSonicFilteredSorted(_ messages: [Message], fromThreadId: Int64?) -> [Message] {
++    var seen = Set<MessageId>()
++    var filtered: [Message] = []
++    for message in messages {
++        if seen.contains(message.id) {
++            continue
++        }
++        if let fromThreadId = fromThreadId, message.threadId != fromThreadId {
++            continue
++        }
++        let isPhoto = message.media.contains(where: { $0 is TelegramMediaImage })
++        let isVideo = message.media.contains(where: { ($0 as? TelegramMediaFile)?.isVideo ?? false })
++        if !isPhoto && !isVideo {
++            continue
++        }
++        seen.insert(message.id)
++        filtered.append(message)
++    }
++    return filtered.sorted(by: { $0.index < $1.index })
++}
++
++/// Processes one wave (a window of several 10-item album chunks): the producer pre-caches the whole
++/// window in parallel, the consumer detaches+enqueues each chunk as one album from local cache, then
++/// the window's cached source payloads are EVICTED immediately to keep disk bounded. Recurses,
++/// carrying the running committed/album counts.
++private func hboltSonicProcessWaves(account: Account, waves: [[Message]], index: Int, toPeerId: PeerId, toThreadId: Int64?, committed: Int, albums: Int) -> Signal<(Int, Int), NoError> {
++    if index >= waves.count {
++        return .single((committed, albums))
++    }
++    let wave = waves[index]
++    // Producer: parallel pre-cache of the whole window (bounded by window size).
++    let precache: Signal<Never, NoError> = combineLatest(wave.map { hboltBulkPrecache(account: account, message: $0) })
++    |> take(1)
++    |> ignoreValues
++    // Consumer: dispatch chunks of 10 from cache, then evict this window's payloads.
++    let dispatch = Signal<Void, NoError>.single(Void())
++    |> mapToSignal { _ -> Signal<(Int, Int), NoError> in
++        var chunkEnqueues: [Signal<Never, NoError>] = []
++        var evictIds: [MediaResourceId] = []
++        var newCommitted = committed
++        var newAlbums = albums
++        var start = 0
++        while start < wave.count {
++            let upper = min(start + 10, wave.count)
++            let groupId: Int64? = (upper - start) >= 2 ? Int64(bitPattern: UInt64.random(in: UInt64.min ... UInt64.max)) : nil
++            var batch: [EnqueueMessage] = []
++            for i in start ..< upper {
++                let message = wave[i]
++                if let media = hboltBulkDetachCached(account: account, message: message) {
++                    batch.append(hboltBulkDetachedMessage(media: media, source: message, toThreadId: toThreadId, groupingKey: groupId))
++                    newCommitted += 1
++                    if let rid = hboltSonicResourceId(message) {
++                        evictIds.append(rid)
++                    }
++                }
++            }
++            if !batch.isEmpty {
++                chunkEnqueues.append(enqueueMessages(account: account, peerId: toPeerId, messages: batch) |> ignoreValues)
++                newAlbums += 1
++            }
++            start += 10
++        }
++        var chain: Signal<Never, NoError> = .complete()
++        for enqueue in chunkEnqueues {
++            chain = chain |> then(enqueue)
++        }
++        let evict: Signal<Never, NoError> = evictIds.isEmpty ? .complete() : (account.postbox.mediaBox.removeCachedResources(evictIds, force: true) |> ignoreValues)
++        return chain |> then(evict) |> then(.single((newCommitted, newAlbums)))
++    }
++    return precache
++    |> then(dispatch)
++    |> mapToSignal { counts -> Signal<(Int, Int), NoError> in
++        return hboltSonicProcessWaves(account: account, waves: waves, index: index + 1, toPeerId: toPeerId, toThreadId: toThreadId, committed: counts.0, albums: counts.1)
++    }
++}
++
++/// Sonic Bulk entry point: drains ALL media (photos + videos), then runs the producer-consumer
++/// fast-lane with bounded disk and per-chunk eviction. Kick-immune: the dispatch reads only local
++/// cache, so a mid-run ban cannot fail already-grabbed items. Ends with a completion summary.
++public func hboltSonicBulkForward(account: Account, fromPeerId: PeerId, fromThreadId: Int64?, toPeerId: PeerId, toThreadId: Int64?) -> Signal<Never, NoError> {
++    let videoLocation: SearchMessagesLocation = .peer(peerId: fromPeerId, fromId: nil, tags: .video, reactions: nil, threadId: fromThreadId, minDate: nil, maxDate: nil)
++    let photoLocation: SearchMessagesLocation = .peer(peerId: fromPeerId, fromId: nil, tags: .photo, reactions: nil, threadId: fromThreadId, minDate: nil, maxDate: nil)
++    return combineLatest(
++        hboltDrainMediaSearch(account: account, location: videoLocation, state: nil, accumulated: []),
++        hboltDrainMediaSearch(account: account, location: photoLocation, state: nil, accumulated: [])
++    )
++    |> mapToSignal { videoMessages, photoMessages -> Signal<Never, NoError> in
++        let messages = hboltSonicFilteredSorted(videoMessages + photoMessages, fromThreadId: fromThreadId)
++        if messages.isEmpty {
++            return hboltBulkCompletionSignal(account: account, toPeerId: toPeerId, toThreadId: toThreadId, sentCount: 0, albumCount: 0, asAlbums: true)
++        }
++        // Window = 3 album chunks (30 items) downloaded in parallel, bounded disk via per-wave evict.
++        let windowItems = 30
++        var waves: [[Message]] = []
++        var index = 0
++        while index < messages.count {
++            waves.append(Array(messages[index ..< min(index + windowItems, messages.count)]))
++            index += windowItems
++        }
++        return hboltSonicProcessWaves(account: account, waves: waves, index: 0, toPeerId: toPeerId, toThreadId: toThreadId, committed: 0, albums: 0)
++        |> mapToSignal { counts -> Signal<Never, NoError> in
++            let text = "Done. Successfully forwarded \(counts.0) items in \(counts.1) albums via Sonic Bulk."
++            let message: EnqueueMessage = .message(text: text, attributes: [], inlineStickers: [:], mediaReference: nil, threadId: toThreadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: nil, correlationId: nil, bubbleUpEmojiOrStickersets: [])
++            return enqueueMessages(account: account, peerId: toPeerId, messages: [message]) |> ignoreValues
++        }
++    }
++}
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
+index 06aa9bf10..c57f5dad4 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
+@@ -347,4 +347,23 @@ extension PeerInfoScreenNode {
+         }
+         self.controller?.push(peerSelectionController)
+     }
++
++    // HBOLT: Sonic Bulk — 1-tap, no Albums/Singles dialog, straight to the target picker. Forwards
++    // ALL media (photos + videos) via the isolated producer-consumer fast-lane pipeline.
++    func hboltSonicBulkStart() {
++        guard self.peerId.namespace != Namespaces.Peer.SecretChat else {
++            return
++        }
++        let fromThreadId = self.chatLocation.threadId
++        let fromPeerId = self.peerId
++        let peerSelectionController = self.context.sharedContext.makePeerSelectionController(PeerSelectionControllerParams(context: self.context, updatedPresentationData: self.controller?.updatedPresentationData, filter: [.onlyWriteable, .excludeDisabled], hasFilters: true, multipleSelection: false, selectForumThreads: true))
++        peerSelectionController.peerSelected = { [weak self, weak peerSelectionController] peer, threadId in
++            guard let strongSelf = self else {
++                return
++            }
++            peerSelectionController?.dismiss()
++            let _ = hboltSonicBulkForward(account: strongSelf.context.account, fromPeerId: fromPeerId, fromThreadId: fromThreadId, toPeerId: peer.id, toThreadId: threadId).startStandalone()
++        }
++        self.controller?.push(peerSelectionController)
++    }
+ }
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayMediaGalleryContextMenu.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayMediaGalleryContextMenu.swift
+index 16c2f6e3e..ede10072e 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayMediaGalleryContextMenu.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayMediaGalleryContextMenu.swift
+@@ -340,6 +340,12 @@ extension PeerInfoScreenNode {
+                     a(.default)
+                     self?.hboltChooseBulkMode(kind: .photo, fromThreadId: hboltFromThreadId)
+                 })))
++                items.append(.action(ContextMenuActionItem(text: "Sonic Bulk (Auto-Albums)", icon: { theme in
++                    return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Resend"), color: theme.contextMenu.primaryColor)
++                }, action: { [weak self] _, a in
++                    a(.default)
++                    self?.hboltSonicBulkStart()
++                })))
+ 
+                 var ignoreNextActions = false
+                 // The pane, not the screen, decides: a profile opened from a channel's direct
