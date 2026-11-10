@@ -1,0 +1,256 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+new file mode 100644
+index 000000000..ba7a7f0da
+--- /dev/null
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -0,0 +1,165 @@
++import Foundation
++import Postbox
++import SwiftSignalKit
++
++// HBOLT: bulk "Forward All Photos / Videos" from a chat's (or topic's) shared media.
++//
++// Design rules:
++//  1. Topic/forum isolation: retrieval is strictly scoped to the active thread. Every item is
++//     asserted to carry the exact threadId, so messages from other topics are 100% excluded.
++//  2. Database-level retrieval: message ids come straight from the Postbox tag index
++//     (getMessageIndicesWithTag) — the full set in one pass, with no dependency on rendered UI
++//     cells and no UI batch caps. Strict .photo / .video tags give type-exact filtering.
++//  3. Deterministic album chunking: the id set is sliced into contiguous chunks of min(10, remaining),
++//     each chunk given one shared groupedId; or dispatched as singles with no grouping.
++//  4. Fresh origination: every item is rebuilt as a standalone message from the current account with
++//     all forwarding provenance stripped (no SourceReferenceMessageAttribute, no forwardInfo).
++//  5. Asynchronous outbox: chunks are pushed into the native EnqueueMessage outbox sequentially and
++//     run in the background, decoupled from the media screen's lifecycle.
++
++public enum HBOLTBulkMediaKind {
++    case photo
++    case video
++}
++
++private func hboltStripProvenance(_ attributes: [MessageAttribute]) -> [MessageAttribute] {
++    return attributes.filter { attr in
++        !(attr is SourceReferenceMessageAttribute)
++            && !(attr is ForwardCountMessageAttribute)
++            && !(attr is EditedMessageAttribute)
++            && !(attr is ReplyMessageAttribute)
++            && !(attr is ReplyMarkupMessageAttribute)
++            && !(attr is ViewCountMessageAttribute)
++            && !(attr is ForwardSourceInfoAttribute)
++    }
++}
++
++/// Rebuilds a source message as a fresh standalone message that reuses the existing server media
++/// object (no raw byte re-upload) and carries no forwarding provenance. nil if there is no primary
++/// photo/video media. For noforwards (restricted) sources the item is instead emitted as a plain
++/// `.forward`, so the existing protected-forward pipeline re-uploads detached local bytes — reusing
++/// a protected source's file reference is rejected by the server, so it must not be used there.
++private func hboltBulkBuildMessage(message: Message, toThreadId: Int64?, groupingKey: Int64?) -> EnqueueMessage? {
++    guard let media = message.media.first(where: { $0 is TelegramMediaImage || $0 is TelegramMediaFile }) else {
++        return nil
++    }
++    if HBOLTSettings.isProtected(message.id.peerId.toInt64()) {
++        // Route through the protected-forward re-upload path (detached local bytes). Grouping is
++        // applied there via the source groupingKey; a forced per-chunk key is not expressible on a
++        // native .forward, so protected albums follow the source's own grouping.
++        return .forward(source: message.id, threadId: toThreadId, grouping: .auto, attributes: [], correlationId: nil)
++    }
++    return .message(text: message.text, attributes: hboltStripProvenance(message.attributes), inlineStickers: [:], mediaReference: .standalone(media: media), threadId: toThreadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: groupingKey, correlationId: nil, bubbleUpEmojiOrStickersets: [])
++}
++
++/// Full set of thread-scoped photo OR video message ids, chronological, DB-level. threadId nil =
++/// whole peer (non-forum). Public so the UI can show an exact count before dispatching.
++public func hboltBulkMediaMessageIds(account: Account, peerId: PeerId, threadId: Int64?, kind: HBOLTBulkMediaKind) -> Signal<[MessageId], NoError> {
++    let tag: MessageTags = (kind == .photo) ? .photo : .video
++    return account.postbox.transaction { transaction -> [MessageId] in
++        let namespace = Namespaces.Message.Cloud
++        let indices = transaction.getMessageIndicesWithTag(peerId: peerId, threadId: threadId, namespace: namespace, tag: tag)
++        var ids: [MessageId] = []
++        for index in indices.sorted(by: { $0 < $1 }) {
++            guard let message = transaction.getMessage(index.id) else {
++                continue
++            }
++            if let threadId = threadId, message.threadId != threadId {
++                continue
++            }
++            switch kind {
++            case .photo:
++                if !message.media.contains(where: { $0 is TelegramMediaImage }) {
++                    continue
++                }
++            case .video:
++                if !message.media.contains(where: { ($0 as? TelegramMediaFile)?.isVideo ?? false }) {
++                    continue
++                }
++            }
++            ids.append(index.id)
++        }
++        return ids
++    }
++}
++
++/// Bulk-forward every photo/video of a thread to a target, chunked into albums of 10 (or singles),
++/// as fresh standalone messages. Enqueues chunks sequentially into the background outbox.
++public func hboltBulkForwardThreadMedia(account: Account, fromPeerId: PeerId, fromThreadId: Int64?, toPeerId: PeerId, toThreadId: Int64?, kind: HBOLTBulkMediaKind, asAlbums: Bool) -> Signal<Never, NoError> {
++    let tag: MessageTags = (kind == .photo) ? .photo : .video
++    return account.postbox.transaction { transaction -> [Message] in
++        let namespace = Namespaces.Message.Cloud
++        let indices = transaction.getMessageIndicesWithTag(peerId: fromPeerId, threadId: fromThreadId, namespace: namespace, tag: tag)
++        var messages: [Message] = []
++        for index in indices.sorted(by: { $0 < $1 }) {
++            guard let message = transaction.getMessage(index.id) else {
++                continue
++            }
++            if let fromThreadId = fromThreadId, message.threadId != fromThreadId {
++                continue
++            }
++            switch kind {
++            case .photo:
++                if !message.media.contains(where: { $0 is TelegramMediaImage }) {
++                    continue
++                }
++            case .video:
++                if !message.media.contains(where: { ($0 as? TelegramMediaFile)?.isVideo ?? false }) {
++                    continue
++                }
++            }
++            messages.append(message)
++        }
++        return messages
++    }
++    |> mapToSignal { messages -> Signal<Never, NoError> in
++        if messages.isEmpty {
++            return .complete()
++        }
++        var batches: [[EnqueueMessage]] = []
++        if asAlbums {
++            var start = 0
++            while start < messages.count {
++                let upper = min(start + 10, messages.count)
++                let count = upper - start
++                let groupId = Int64(bitPattern: UInt64.random(in: UInt64.min ... UInt64.max))
++                var batch: [EnqueueMessage] = []
++                for i in start ..< upper {
++                    if let enqueue = hboltBulkBuildMessage(message: messages[i], toThreadId: toThreadId, groupingKey: count >= 2 ? groupId : nil) {
++                        batch.append(enqueue)
++                    }
++                }
++                if !batch.isEmpty {
++                    batches.append(batch)
++                }
++                start += 10
++            }
++        } else {
++            var batch: [EnqueueMessage] = []
++            for message in messages {
++                if let enqueue = hboltBulkBuildMessage(message: message, toThreadId: toThreadId, groupingKey: nil) {
++                    batch.append(enqueue)
++                    if batch.count >= 20 {
++                        batches.append(batch)
++                        batch = []
++                    }
++                }
++            }
++            if !batch.isEmpty {
++                batches.append(batch)
++            }
++        }
++        if batches.isEmpty {
++            return .complete()
++        }
++        var signal: Signal<Never, NoError> = .complete()
++        for batch in batches {
++            signal = signal
++            |> then(
++                enqueueMessages(account: account, peerId: toPeerId, messages: batch)
++                |> ignoreValues
++            )
++        }
++        return signal
++    }
++}
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
+index 9ff46141a..98101e8e8 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
+@@ -71,6 +71,11 @@ extension PeerInfoScreenNode {
+     }
+     
+     func forwardMessages(messageIds: Set<EngineMessage.Id>?) {
++        // HBOLT: with no selection, offer bulk "Forward All Photos / Videos" from shared media.
++        if (messageIds ?? self.state.selectedMessageIds ?? Set()).isEmpty {
++            self.hboltPresentBulkMediaForward()
++            return
++        }
+         if let messageIds = messageIds ?? self.state.selectedMessageIds, !messageIds.isEmpty {
+             let peerSelectionController = self.context.sharedContext.makePeerSelectionController(PeerSelectionControllerParams(context: self.context, updatedPresentationData: self.controller?.updatedPresentationData, filter: [.onlyWriteable, .excludeDisabled], hasFilters: true, multipleSelection: true, selectForumThreads: true))
+             peerSelectionController.multiplePeersSelected = { [weak self, weak peerSelectionController] peers, peerMap, messageText, mode, forwardOptions, _ in
+@@ -278,4 +283,68 @@ extension PeerInfoScreenNode {
+             self.controller?.push(peerSelectionController)
+         }
+     }
++
++    // HBOLT: bulk "Forward All Photos / Videos" from this chat's (or topic's) shared media.
++    func hboltPresentBulkMediaForward() {
++        guard self.peerId.namespace != Namespaces.Peer.SecretChat else {
++            return
++        }
++        let fromThreadId = self.chatLocation.threadId
++        let presentationData = self.presentationData
++        let actionSheet = ActionSheetController(presentationData: presentationData)
++        actionSheet.setItemGroups([
++            ActionSheetItemGroup(items: [
++                ActionSheetButtonItem(title: "Forward All Photos", color: .accent, action: { [weak self, weak actionSheet] in
++                    actionSheet?.dismissAnimated()
++                    self?.hboltChooseBulkMode(kind: .photo, fromThreadId: fromThreadId)
++                }),
++                ActionSheetButtonItem(title: "Forward All Videos", color: .accent, action: { [weak self, weak actionSheet] in
++                    actionSheet?.dismissAnimated()
++                    self?.hboltChooseBulkMode(kind: .video, fromThreadId: fromThreadId)
++                })
++            ]),
++            ActionSheetItemGroup(items: [
++                ActionSheetButtonItem(title: presentationData.strings.Common_Cancel, color: .accent, font: .bold, action: { [weak actionSheet] in
++                    actionSheet?.dismissAnimated()
++                })
++            ])
++        ])
++        self.controller?.present(actionSheet, in: .window(.root))
++    }
++
++    private func hboltChooseBulkMode(kind: HBOLTBulkMediaKind, fromThreadId: Int64?) {
++        let presentationData = self.presentationData
++        let actionSheet = ActionSheetController(presentationData: presentationData)
++        actionSheet.setItemGroups([
++            ActionSheetItemGroup(items: [
++                ActionSheetButtonItem(title: "Send as Albums", color: .accent, action: { [weak self, weak actionSheet] in
++                    actionSheet?.dismissAnimated()
++                    self?.hboltPickTargetAndBulkSend(kind: kind, fromThreadId: fromThreadId, asAlbums: true)
++                }),
++                ActionSheetButtonItem(title: "Send as Singles", color: .accent, action: { [weak self, weak actionSheet] in
++                    actionSheet?.dismissAnimated()
++                    self?.hboltPickTargetAndBulkSend(kind: kind, fromThreadId: fromThreadId, asAlbums: false)
++                })
++            ]),
++            ActionSheetItemGroup(items: [
++                ActionSheetButtonItem(title: presentationData.strings.Common_Cancel, color: .accent, font: .bold, action: { [weak actionSheet] in
++                    actionSheet?.dismissAnimated()
++                })
++            ])
++        ])
++        self.controller?.present(actionSheet, in: .window(.root))
++    }
++
++    private func hboltPickTargetAndBulkSend(kind: HBOLTBulkMediaKind, fromThreadId: Int64?, asAlbums: Bool) {
++        let fromPeerId = self.peerId
++        let peerSelectionController = self.context.sharedContext.makePeerSelectionController(PeerSelectionControllerParams(context: self.context, updatedPresentationData: self.controller?.updatedPresentationData, filter: [.onlyWriteable, .excludeDisabled], hasFilters: true, multipleSelection: false, selectForumThreads: true))
++        peerSelectionController.peerSelected = { [weak self, weak peerSelectionController] peer, threadId in
++            guard let strongSelf = self else {
++                return
++            }
++            peerSelectionController?.dismiss()
++            let _ = hboltBulkForwardThreadMedia(account: strongSelf.context.account, fromPeerId: fromPeerId, fromThreadId: fromThreadId, toPeerId: peer.id, toThreadId: threadId, kind: kind, asAlbums: asAlbums).startStandalone()
++        }
++        self.controller?.push(peerSelectionController)
++    }
+ }
