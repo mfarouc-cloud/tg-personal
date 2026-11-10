@@ -1,0 +1,151 @@
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/HBOLTBackgroundKeepAlive.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/HBOLTBackgroundKeepAlive.swift
+new file mode 100644
+index 000000000..2d2d44932
+--- /dev/null
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/HBOLTBackgroundKeepAlive.swift
+@@ -0,0 +1,115 @@
++import Foundation
++import AVFoundation
++
++// HBOLT: keeps the app running in the background during long bulk / Sonic forward operations.
++// iOS suspends network activity ~30s after the screen locks or the app backgrounds; playing an
++// infinite zero-volume silent buffer under the `audio` background mode (already declared in the app
++// Info.plist) keeps the process scheduled so the upload pipeline drains to completion.
++//
++// Ref-counted: concurrent operations share one session, and it is torn down (player stopped,
++// AVAudioSession deactivated) only when the last operation ends — so there is zero cost when idle.
++// `.mixWithOthers` means it never interrupts the user's own music/podcasts.
++final class HBOLTBackgroundKeepAlive {
++    static let shared = HBOLTBackgroundKeepAlive()
++
++    private let lock = NSLock()
++    private var refCount = 0
++    private var player: AVAudioPlayer?
++
++    private init() {
++    }
++
++    /// Begin (or join) a keep-alive session. Safe to call from any thread; AV work hops to main.
++    func start() {
++        lock.lock()
++        refCount += 1
++        let shouldActivate = (refCount == 1)
++        lock.unlock()
++        if !shouldActivate {
++            return
++        }
++        let activate: () -> Void = { [weak self] in
++            guard let self = self else {
++                return
++            }
++            do {
++                let session = AVAudioSession.sharedInstance()
++                try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
++                try session.setActive(true)
++                if self.player == nil {
++                    let player = try AVAudioPlayer(data: HBOLTBackgroundKeepAlive.silentWavData())
++                    player.numberOfLoops = -1
++                    player.volume = 0.0
++                    player.prepareToPlay()
++                    self.player = player
++                }
++                self.player?.play()
++            } catch {
++            }
++        }
++        if Thread.isMainThread {
++            activate()
++        } else {
++            DispatchQueue.main.async(execute: activate)
++        }
++    }
++
++    /// End one keep-alive session. When the last ends, the player stops and the session deactivates.
++    func stop() {
++        lock.lock()
++        if refCount > 0 {
++            refCount -= 1
++        }
++        let shouldDeactivate = (refCount == 0)
++        lock.unlock()
++        if !shouldDeactivate {
++            return
++        }
++        let deactivate: () -> Void = { [weak self] in
++            guard let self = self else {
++                return
++            }
++            self.player?.stop()
++            try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
++        }
++        if Thread.isMainThread {
++            deactivate()
++        } else {
++            DispatchQueue.main.async(execute: deactivate)
++        }
++    }
++
++    /// A 1-second mono 16-bit PCM silent WAV, generated in memory so no audio asset is bundled.
++    private static func silentWavData() -> Data {
++        let sampleRate: UInt32 = 8000
++        let bytesPerSample: UInt32 = 2
++        let dataSize: UInt32 = sampleRate * bytesPerSample // 1 second
++        var data = Data()
++        func appendString(_ string: String) {
++            data.append(string.data(using: .ascii)!)
++        }
++        func appendU32(_ value: UInt32) {
++            var v = value.littleEndian
++            withUnsafeBytes(of: &v) { data.append(contentsOf: $0) }
++        }
++        func appendU16(_ value: UInt16) {
++            var v = value.littleEndian
++            withUnsafeBytes(of: &v) { data.append(contentsOf: $0) }
++        }
++        appendString("RIFF")
++        appendU32(36 + dataSize)
++        appendString("WAVE")
++        appendString("fmt ")
++        appendU32(16)
++        appendU16(1) // PCM
++        appendU16(1) // mono
++        appendU32(sampleRate)
++        appendU32(sampleRate * bytesPerSample) // byte rate
++        appendU16(UInt16(bytesPerSample)) // block align
++        appendU16(16) // bits per sample
++        appendString("data")
++        appendU32(dataSize)
++        data.append(Data(count: Int(dataSize))) // silence
++        return data
++    }
++}
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
+index c57f5dad4..8652300a5 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
+@@ -343,7 +343,11 @@ extension PeerInfoScreenNode {
+                 return
+             }
+             peerSelectionController?.dismiss()
+-            let _ = hboltBulkForwardThreadMedia(account: strongSelf.context.account, fromPeerId: fromPeerId, fromThreadId: fromThreadId, toPeerId: peer.id, toThreadId: threadId, kind: kind, asAlbums: asAlbums).startStandalone()
++            HBOLTBackgroundKeepAlive.shared.start()
++            let _ = (hboltBulkForwardThreadMedia(account: strongSelf.context.account, fromPeerId: fromPeerId, fromThreadId: fromThreadId, toPeerId: peer.id, toThreadId: threadId, kind: kind, asAlbums: asAlbums)
++            |> afterDisposed {
++                HBOLTBackgroundKeepAlive.shared.stop()
++            }).startStandalone()
+         }
+         self.controller?.push(peerSelectionController)
+     }
+@@ -362,7 +366,11 @@ extension PeerInfoScreenNode {
+                 return
+             }
+             peerSelectionController?.dismiss()
+-            let _ = hboltSonicBulkForward(account: strongSelf.context.account, fromPeerId: fromPeerId, fromThreadId: fromThreadId, toPeerId: peer.id, toThreadId: threadId).startStandalone()
++            HBOLTBackgroundKeepAlive.shared.start()
++            let _ = (hboltSonicBulkForward(account: strongSelf.context.account, fromPeerId: fromPeerId, fromThreadId: fromThreadId, toPeerId: peer.id, toThreadId: threadId)
++            |> afterDisposed {
++                HBOLTBackgroundKeepAlive.shared.stop()
++            }).startStandalone()
+         }
+         self.controller?.push(peerSelectionController)
+     }
