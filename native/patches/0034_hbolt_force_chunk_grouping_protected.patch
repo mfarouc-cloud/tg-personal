@@ -1,0 +1,161 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+index 2b3bcb7b8..65d2d40ec 100644
+--- a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+@@ -218,6 +218,33 @@ private func hboltDownloadThenSendGroup(account: Account, peerId: PeerId, items:
+     hboltDeferredSends.add(send.start())
+ }
+ 
++/// HBOLT bulk entry: re-upload a chunk of protected messages as ONE intact album under a FORCED
++/// grouping key (the source's own groupedId is ignored). Downloads every item's bytes (cache-first,
++/// bounded) then enqueues the whole chunk together so it lands as a single album of up to 10. Returns
++/// a Signal so the caller can sequence chunks instead of downloading everything at once.
++func hboltBulkProtectedAlbumSignal(account: Account, toPeerId: PeerId, toThreadId: Int64?, messages: [Message], forcedGroupingKey: Int64?) -> Signal<Never, NoError> {
++    if messages.isEmpty {
++        return .complete()
++    }
++    let items = messages.map { HBOLTDeferredForward(message: $0, threadId: toThreadId, attributes: [], correlationId: nil, localGroupingKey: forcedGroupingKey) }
++    let readies = items.map { hboltMediaReadySignal(account: account, message: $0.message) }
++    return combineLatest(readies)
++    |> take(1)
++    |> mapToSignal { _ -> Signal<Never, NoError> in
++        var converted: [EnqueueMessage] = []
++        for item in items {
++            if let message = hboltConvertForward(account: account, message: item.message, threadId: item.threadId, attributes: item.attributes, correlationId: item.correlationId, localGroupingKey: item.localGroupingKey, viewOnce: false) {
++                converted.append(message)
++            }
++        }
++        if converted.isEmpty {
++            return .complete()
++        }
++        return enqueueMessages(account: account, peerId: toPeerId, messages: converted)
++        |> ignoreValues
++    }
++}
++
+ /// HBOLT: re-send forwards from protected (noforwards) chats as fresh standalone messages.
+ /// Cache-first and album-safe: a fully-cached album is sent instantly as one grouped batch; an
+ /// album with any uncached item is deferred as a whole and sent together once downloaded. Topic
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index 9361e9559..49372c666 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -38,16 +38,48 @@ private func hboltStripProvenance(_ attributes: [MessageAttribute]) -> [MessageA
+     }
+ }
+ 
+-private func hboltBulkBuildMessage(message: Message, toThreadId: Int64?, groupingKey: Int64?) -> EnqueueMessage? {
++/// Reuse-media standalone message (for non-restricted sources): no re-upload, provenance stripped,
++/// carries the forced chunk grouping key.
++private func hboltBulkReuseMessage(message: Message, toThreadId: Int64?, groupingKey: Int64?) -> EnqueueMessage? {
+     guard let media = message.media.first(where: { $0 is TelegramMediaImage || $0 is TelegramMediaFile }) else {
+         return nil
+     }
+-    if HBOLTSettings.isProtected(message.id.peerId.toInt64()) {
+-        return .forward(source: message.id, threadId: toThreadId, grouping: .auto, attributes: [], correlationId: nil)
+-    }
+     return .message(text: message.text, attributes: hboltStripProvenance(message.attributes), inlineStickers: [:], mediaReference: .standalone(media: media), threadId: toThreadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: groupingKey, correlationId: nil, bubbleUpEmojiOrStickersets: [])
+ }
+ 
++/// Sends ONE chunk (<= 10 items) as a single album under the forced groupingKey, regardless of the
++/// source's own groupedId. Restricted (noforwards) items are re-uploaded as detached local bytes via
++/// the protected album pipeline; the rest reuse the server media object. Returns a Signal so chunks
++/// are sequenced (never all downloaded at once).
++private func hboltBulkSendChunk(account: Account, toPeerId: PeerId, toThreadId: Int64?, chunk: [Message], groupingKey: Int64?) -> Signal<Never, NoError> {
++    if chunk.isEmpty {
++        return .complete()
++    }
++    let protectedMessages = chunk.filter { HBOLTSettings.isProtected($0.id.peerId.toInt64()) }
++    let reusableMessages = chunk.filter { !HBOLTSettings.isProtected($0.id.peerId.toInt64()) }
++
++    var parts: [Signal<Never, NoError>] = []
++    if !reusableMessages.isEmpty {
++        var batch: [EnqueueMessage] = []
++        for message in reusableMessages {
++            if let enqueue = hboltBulkReuseMessage(message: message, toThreadId: toThreadId, groupingKey: groupingKey) {
++                batch.append(enqueue)
++            }
++        }
++        if !batch.isEmpty {
++            parts.append(enqueueMessages(account: account, peerId: toPeerId, messages: batch) |> ignoreValues)
++        }
++    }
++    if !protectedMessages.isEmpty {
++        parts.append(hboltBulkProtectedAlbumSignal(account: account, toPeerId: toPeerId, toThreadId: toThreadId, messages: protectedMessages, forcedGroupingKey: groupingKey))
++    }
++    var signal: Signal<Never, NoError> = .complete()
++    for part in parts {
++        signal = signal |> then(part)
++    }
++    return signal
++}
++
+ /// Drains the server-side media search to completion, accumulating every matching message.
+ private func hboltDrainMediaSearch(account: Account, location: SearchMessagesLocation, state: SearchMessagesState?, accumulated: [Message]) -> Signal<[Message], NoError> {
+     return TelegramEngine(account: account).messages.searchMessages(location: location, query: "", state: state, limit: 100)
+@@ -110,49 +142,34 @@ public func hboltBulkForwardThreadMedia(account: Account, fromPeerId: PeerId, fr
+         if messages.isEmpty {
+             return .complete()
+         }
+-        var batches: [[EnqueueMessage]] = []
++        // Slice the full drained set into contiguous chunks and dispatch each as one send unit,
++        // sequenced so downloads don't all run at once.
++        var chunkSignals: [Signal<Never, NoError>] = []
+         if asAlbums {
+             var start = 0
+             while start < messages.count {
+                 let upper = min(start + 10, messages.count)
+-                let count = upper - start
+-                let groupId = Int64(bitPattern: UInt64.random(in: UInt64.min ... UInt64.max))
+-                var batch: [EnqueueMessage] = []
+-                for i in start ..< upper {
+-                    if let enqueue = hboltBulkBuildMessage(message: messages[i], toThreadId: toThreadId, groupingKey: count >= 2 ? groupId : nil) {
+-                        batch.append(enqueue)
+-                    }
+-                }
+-                if !batch.isEmpty {
+-                    batches.append(batch)
+-                }
++                let chunk = Array(messages[start ..< upper])
++                // One shared groupedId for the whole slice; a lone trailing item can't be an album.
++                let groupId: Int64? = chunk.count >= 2 ? Int64(bitPattern: UInt64.random(in: UInt64.min ... UInt64.max)) : nil
++                chunkSignals.append(hboltBulkSendChunk(account: account, toPeerId: toPeerId, toThreadId: toThreadId, chunk: chunk, groupingKey: groupId))
+                 start += 10
+             }
+         } else {
+-            var batch: [EnqueueMessage] = []
+-            for message in messages {
+-                if let enqueue = hboltBulkBuildMessage(message: message, toThreadId: toThreadId, groupingKey: nil) {
+-                    batch.append(enqueue)
+-                    if batch.count >= 20 {
+-                        batches.append(batch)
+-                        batch = []
+-                    }
+-                }
+-            }
+-            if !batch.isEmpty {
+-                batches.append(batch)
++            var start = 0
++            while start < messages.count {
++                let upper = min(start + 20, messages.count)
++                let chunk = Array(messages[start ..< upper])
++                chunkSignals.append(hboltBulkSendChunk(account: account, toPeerId: toPeerId, toThreadId: toThreadId, chunk: chunk, groupingKey: nil))
++                start += 20
+             }
+         }
+-        if batches.isEmpty {
++        if chunkSignals.isEmpty {
+             return .complete()
+         }
+         var signal: Signal<Never, NoError> = .complete()
+-        for batch in batches {
+-            signal = signal
+-            |> then(
+-                enqueueMessages(account: account, peerId: toPeerId, messages: batch)
+-                |> ignoreValues
+-            )
++        for chunkSignal in chunkSignals {
++            signal = signal |> then(chunkSignal)
+         }
+         return signal
+     }
