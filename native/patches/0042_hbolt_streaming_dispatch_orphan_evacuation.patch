@@ -1,0 +1,202 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index 974238d0e..ace9c94ea 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -296,65 +296,90 @@ private func hboltSonicFilteredSorted(_ messages: [Message], fromThreadId: Int64
+     return filtered.sorted(by: { $0.index < $1.index })
+ }
+ 
+-/// Running counts across waves (kept outside the signal graph so every stage stays `Never`-typed).
+-private final class HBOLTSonicCounter {
+-    var committed: Int = 0
+-    var albums: Int = 0
++// Task-scoped accumulator + the full resource list, so the pipeline can evict every downloaded
++// payload (even on a mid-run kick/cancel) and report an accurate count.
++private final class HBOLTSonicTask {
++    var committed = 0
++    var albums = 0
++    var total = 0
++    var resourceIds: [MediaResourceId] = []
+ }
+ 
+-/// Processes one wave (a window of several 10-item album chunks): the producer pre-caches the whole
+-/// window in parallel, the consumer detaches+enqueues each chunk as one album from local cache, then
+-/// the window's cached source payloads are EVICTED immediately to keep disk bounded. Recurses.
+-private func hboltSonicProcessWaves(account: Account, waves: [[Message]], index: Int, toPeerId: PeerId, toThreadId: Int64?, counter: HBOLTSonicCounter) -> Signal<Never, NoError> {
+-    if index >= waves.count {
++// Retains orphan-eviction cleanups fired from afterDisposed until they finish.
++private let hboltSonicCleanup = DisposableSet()
++
++/// Streaming per-album pipeline: pre-cache ONE <=10 chunk, IMMEDIATELY dispatch it from local cache
++/// as a single forced-groupedId album, evict that chunk's payloads, then recurse. Dispatch is never
++/// buffered behind a full pass, so a kick only risks the single in-flight chunk.
++private func hboltSonicStreamChunks(account: Account, messages: [Message], index: Int, toPeerId: PeerId, toThreadId: Int64?, task: HBOLTSonicTask) -> Signal<Never, NoError> {
++    if index >= messages.count {
+         return .complete()
+     }
+-    let wave = waves[index]
+-    let precache: Signal<Never, NoError> = combineLatest(wave.map { hboltBulkPrecache(account: account, message: $0) })
++    let upper = min(index + 10, messages.count)
++    let chunk = Array(messages[index ..< upper])
++    let precache: Signal<Never, NoError> = combineLatest(chunk.map { hboltBulkPrecache(account: account, message: $0) })
+     |> take(1)
+     |> ignoreValues
+     let dispatch: Signal<Never, NoError> = Signal<Void, NoError>.single(Void())
+     |> mapToSignal { _ -> Signal<Never, NoError> in
+-        var chunkEnqueues: [Signal<Never, NoError>] = []
++        let groupId: Int64? = chunk.count >= 2 ? Int64(bitPattern: UInt64.random(in: UInt64.min ... UInt64.max)) : nil
++        var batch: [EnqueueMessage] = []
+         var evictIds: [MediaResourceId] = []
+-        var start = 0
+-        while start < wave.count {
+-            let upper = min(start + 10, wave.count)
+-            let groupId: Int64? = (upper - start) >= 2 ? Int64(bitPattern: UInt64.random(in: UInt64.min ... UInt64.max)) : nil
+-            var batch: [EnqueueMessage] = []
+-            for i in start ..< upper {
+-                let message = wave[i]
+-                if let media = hboltBulkDetachCached(account: account, message: message) {
+-                    batch.append(hboltBulkDetachedMessage(media: media, source: message, toThreadId: toThreadId, groupingKey: groupId))
+-                    counter.committed += 1
+-                    if let rid = hboltSonicResourceId(message) {
+-                        evictIds.append(rid)
+-                    }
++        for message in chunk {
++            if let media = hboltBulkDetachCached(account: account, message: message) {
++                batch.append(hboltBulkDetachedMessage(media: media, source: message, toThreadId: toThreadId, groupingKey: groupId))
++                task.committed += 1
++                if let rid = hboltSonicResourceId(message) {
++                    evictIds.append(rid)
+                 }
+             }
+-            if !batch.isEmpty {
+-                chunkEnqueues.append(enqueueMessages(account: account, peerId: toPeerId, messages: batch) |> ignoreValues)
+-                counter.albums += 1
+-            }
+-            start += 10
+         }
+-        var chain: Signal<Never, NoError> = .complete()
+-        for enqueue in chunkEnqueues {
+-            chain = chain |> then(enqueue)
++        var send: Signal<Never, NoError> = .complete()
++        if !batch.isEmpty {
++            send = enqueueMessages(account: account, peerId: toPeerId, messages: batch) |> ignoreValues
++            task.albums += 1
+         }
+         let evict: Signal<Never, NoError> = evictIds.isEmpty ? .complete() : (account.postbox.mediaBox.removeCachedResources(evictIds, force: true) |> ignoreValues)
+-        return chain |> then(evict)
++        return send |> then(evict)
+     }
+     let next: Signal<Never, NoError> = Signal<Void, NoError>.single(Void())
+     |> mapToSignal { _ -> Signal<Never, NoError> in
+-        return hboltSonicProcessWaves(account: account, waves: waves, index: index + 1, toPeerId: toPeerId, toThreadId: toThreadId, counter: counter)
++        return hboltSonicStreamChunks(account: account, messages: messages, index: index + 10, toPeerId: toPeerId, toThreadId: toThreadId, task: task)
+     }
+     return precache |> then(dispatch) |> then(next)
+ }
+ 
+-/// Sonic Bulk entry point: drains ALL media (photos + videos), then runs the producer-consumer
+-/// fast-lane with bounded disk and per-chunk eviction. Kick-immune: the dispatch reads only local
+-/// cache, so a mid-run ban cannot fail already-grabbed items. Ends with a completion summary.
++/// Runs the streaming pipeline, with GUARANTEED orphan eviction on any termination (completion,
++/// error, or a hard kick/cancel) and a rescued/normal completion summary.
++private func hboltSonicRun(account: Account, messages: [Message], toPeerId: PeerId, toThreadId: Int64?, label: String) -> Signal<Never, NoError> {
++    let task = HBOLTSonicTask()
++    task.total = messages.count
++    task.resourceIds = messages.compactMap { hboltSonicResourceId($0) }
++    if messages.isEmpty {
++        return hboltBulkCompletionSignal(account: account, toPeerId: toPeerId, toThreadId: toThreadId, sentCount: 0, albumCount: 0, asAlbums: true)
++    }
++    let process = hboltSonicStreamChunks(account: account, messages: messages, index: 0, toPeerId: toPeerId, toThreadId: toThreadId, task: task)
++    let completion: Signal<Never, NoError> = Signal<Void, NoError>.single(Void())
++    |> mapToSignal { _ -> Signal<Never, NoError> in
++        let text: String
++        if task.committed < task.total {
++            text = "Done (Rescued). Successfully forwarded \(task.committed) cached items before access revocation."
++        } else {
++            text = "Done. Successfully forwarded \(task.committed) items in \(task.albums) albums via \(label)."
++        }
++        let message: EnqueueMessage = .message(text: text, attributes: [], inlineStickers: [:], mediaReference: nil, threadId: toThreadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: nil, correlationId: nil, bubbleUpEmojiOrStickersets: [])
++        return enqueueMessages(account: account, peerId: toPeerId, messages: [message]) |> ignoreValues
++    }
++    return (process |> then(completion))
++    |> afterDisposed {
++        // Orphan evacuation: free every downloaded payload for this task, even if kicked/cancelled
++        // mid-download (removeCachedResources is idempotent for chunks already evicted above).
++        if !task.resourceIds.isEmpty {
++            hboltSonicCleanup.add((account.postbox.mediaBox.removeCachedResources(task.resourceIds, force: true) |> ignoreValues).start())
++        }
++    }
++}
++
+ public func hboltSonicBulkForward(account: Account, fromPeerId: PeerId, fromThreadId: Int64?, toPeerId: PeerId, toThreadId: Int64?) -> Signal<Never, NoError> {
+     let videoLocation: SearchMessagesLocation = .peer(peerId: fromPeerId, fromId: nil, tags: .video, reactions: nil, threadId: fromThreadId, minDate: nil, maxDate: nil)
+     let photoLocation: SearchMessagesLocation = .peer(peerId: fromPeerId, fromId: nil, tags: .photo, reactions: nil, threadId: fromThreadId, minDate: nil, maxDate: nil)
+@@ -364,29 +389,11 @@ public func hboltSonicBulkForward(account: Account, fromPeerId: PeerId, fromThre
+     )
+     |> mapToSignal { videoMessages, photoMessages -> Signal<Never, NoError> in
+         let messages = hboltSonicFilteredSorted(videoMessages + photoMessages, fromThreadId: fromThreadId)
+-        if messages.isEmpty {
+-            return hboltBulkCompletionSignal(account: account, toPeerId: toPeerId, toThreadId: toThreadId, sentCount: 0, albumCount: 0, asAlbums: true)
+-        }
+-        let windowItems = 30
+-        var waves: [[Message]] = []
+-        var index = 0
+-        while index < messages.count {
+-            waves.append(Array(messages[index ..< min(index + windowItems, messages.count)]))
+-            index += windowItems
+-        }
+-        let counter = HBOLTSonicCounter()
+-        let process = hboltSonicProcessWaves(account: account, waves: waves, index: 0, toPeerId: toPeerId, toThreadId: toThreadId, counter: counter)
+-        let completion: Signal<Never, NoError> = Signal<Void, NoError>.single(Void())
+-        |> mapToSignal { _ -> Signal<Never, NoError> in
+-            let text = "Done. Successfully forwarded \(counter.committed) items in \(counter.albums) albums via Sonic Bulk."
+-            let message: EnqueueMessage = .message(text: text, attributes: [], inlineStickers: [:], mediaReference: nil, threadId: toThreadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: nil, correlationId: nil, bubbleUpEmojiOrStickersets: [])
+-            return enqueueMessages(account: account, peerId: toPeerId, messages: [message]) |> ignoreValues
+-        }
+-        return process |> then(completion)
++        return hboltSonicRun(account: account, messages: messages, toPeerId: toPeerId, toThreadId: toThreadId, label: "Sonic Bulk")
+     }
+ }
+ 
+-// MARK: - Selected Bulk: the Sonic producer-consumer pipeline scoped to explicitly selected items.
++// MARK: - Selected Bulk: the Sonic streaming pipeline scoped to explicitly selected items.
+ 
+ private func hboltSelectedFilteredSorted(_ messages: [Message]) -> [Message] {
+     var seen = Set<MessageId>()
+@@ -405,9 +412,6 @@ private func hboltSelectedFilteredSorted(_ messages: [Message]) -> [Message] {
+     return out.sorted(by: { $0.index < $1.index })
+ }
+ 
+-/// Selected Bulk: identical pipeline to Sonic Bulk (bounded pre-cache waves, detached local send,
+-/// forced 10-item albums, per-wave eviction, kick-immunity, completion count) but fed only the
+-/// explicitly selected message ids — no searchMessages drain of the whole chat.
+ public func hboltSelectedBulkForward(account: Account, messageIds: [MessageId], toPeerId: PeerId, toThreadId: Int64?) -> Signal<Never, NoError> {
+     if messageIds.isEmpty {
+         return .complete()
+@@ -423,25 +427,7 @@ public func hboltSelectedBulkForward(account: Account, messageIds: [MessageId],
+     }
+     |> mapToSignal { rawMessages -> Signal<Never, NoError> in
+         let messages = hboltSelectedFilteredSorted(rawMessages)
+-        if messages.isEmpty {
+-            return .complete()
+-        }
+-        let windowItems = 30
+-        var waves: [[Message]] = []
+-        var index = 0
+-        while index < messages.count {
+-            waves.append(Array(messages[index ..< min(index + windowItems, messages.count)]))
+-            index += windowItems
+-        }
+-        let counter = HBOLTSonicCounter()
+-        let process = hboltSonicProcessWaves(account: account, waves: waves, index: 0, toPeerId: toPeerId, toThreadId: toThreadId, counter: counter)
+-        let completion: Signal<Never, NoError> = Signal<Void, NoError>.single(Void())
+-        |> mapToSignal { _ -> Signal<Never, NoError> in
+-            let text = "Done. Successfully forwarded \(counter.committed) items in \(counter.albums) albums via Selected Bulk."
+-            let message: EnqueueMessage = .message(text: text, attributes: [], inlineStickers: [:], mediaReference: nil, threadId: toThreadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: nil, correlationId: nil, bubbleUpEmojiOrStickersets: [])
+-            return enqueueMessages(account: account, peerId: toPeerId, messages: [message]) |> ignoreValues
+-        }
+-        return process |> then(completion)
++        return hboltSonicRun(account: account, messages: messages, toPeerId: toPeerId, toThreadId: toThreadId, label: "Selected Bulk")
+     }
+ }
+ 
