@@ -1,0 +1,13 @@
+diff --git a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+index b5ab2e724..a06ccb9c5 100644
+--- a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
++++ b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+@@ -1367,7 +1367,7 @@ func contextMenuForChatPresentationInterfaceState(chatPresentationInterfaceState
+                 let _ = (hboltSaveCleanToSavedMessages(account: context.account, message: message)
+                 |> deliverOnMainQueue).startStandalone(next: { success in
+                     if success {
+-                        controllerInteraction?.displayUndo(.mediaSaved(text: "Saved permanently to Saved Messages"))
++                        controllerInteraction.displayUndo(.mediaSaved(text: "Saved permanently to Saved Messages"))
+                     }
+                 })
+             })))
