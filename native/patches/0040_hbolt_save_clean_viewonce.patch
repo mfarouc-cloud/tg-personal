@@ -1,0 +1,62 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index c2c107c78..974238d0e 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -444,3 +444,33 @@ public func hboltSelectedBulkForward(account: Account, messageIds: [MessageId],
+         return process |> then(completion)
+     }
+ }
++
++// MARK: - Save Clean to Saved Messages: strip view-once/TTL and re-upload as permanent media.
++
++/// Pulls a view-once / self-destructing media from local cache (downloading if needed), strips ALL
++/// expiration (no AutoremoveTimeoutMessageAttribute, fresh detached media), and re-uploads it to the
++/// account's Saved Messages as a standard permanent item — never a .forward reference, which would
++/// render as "Expired". Emits true on dispatch, false if the media could not be read.
++public func hboltSaveCleanToSavedMessages(account: Account, message: Message) -> Signal<Bool, NoError> {
++    guard message.media.contains(where: { $0 is TelegramMediaImage || $0 is TelegramMediaFile }) else {
++        return .single(false)
++    }
++    return hboltBulkPrecache(account: account, message: message)
++    |> mapToSignal { _ -> Signal<Bool, NoError> in
++        guard let media = hboltBulkDetachCached(account: account, message: message) else {
++            return .single(false)
++        }
++        let attributes = message.attributes.filter { attr in
++            !(attr is AutoremoveTimeoutMessageAttribute)
++                && !(attr is SourceReferenceMessageAttribute)
++                && !(attr is ForwardCountMessageAttribute)
++                && !(attr is ReplyMessageAttribute)
++                && !(attr is ReplyMarkupMessageAttribute)
++                && !(attr is ViewCountMessageAttribute)
++                && !(attr is ForwardSourceInfoAttribute)
++        }
++        let enqueue: EnqueueMessage = .message(text: message.text, attributes: attributes, inlineStickers: [:], mediaReference: .standalone(media: media), threadId: nil, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: nil, correlationId: nil, bubbleUpEmojiOrStickersets: [])
++        return enqueueMessages(account: account, peerId: account.peerId, messages: [enqueue])
++        |> map { _ in true }
++    }
++}
+diff --git a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+index e864340eb..b5ab2e724 100644
+--- a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
++++ b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+@@ -1359,6 +1359,19 @@ func contextMenuForChatPresentationInterfaceState(chatPresentationInterfaceState
+                 let _ = enqueueMessages(account: context.account, peerId: context.account.peerId, messages: enqueue).startStandalone()
+             })))
+         }
++        if message.attributes.contains(where: { ($0 as? AutoremoveTimeoutMessageAttribute)?.timeout == viewOnceTimeout }) && message.media.contains(where: { $0 is TelegramMediaImage || $0 is TelegramMediaFile }) {
++            actions.append(.action(ContextMenuActionItem(text: "🫧 Save Clean to Saved Messages", icon: { theme in
++                return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Download"), color: theme.actionSheet.primaryTextColor)
++            }, action: { c, f in
++                f(.default)
++                let _ = (hboltSaveCleanToSavedMessages(account: context.account, message: message)
++                |> deliverOnMainQueue).startStandalone(next: { success in
++                    if success {
++                        controllerInteraction?.displayUndo(.mediaSaved(text: "Saved permanently to Saved Messages"))
++                    }
++                })
++            })))
++        }
+         if let hboltAuthor = message.author {
+             actions.append(.action(ContextMenuActionItem(text: "👤 Member info (HBOLT)", icon: { theme in
+                 return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Info"), color: theme.actionSheet.primaryTextColor)
