@@ -1,0 +1,20 @@
+diff --git a/submodules/TelegramUI/Sources/OpenResolvedUrl.swift b/submodules/TelegramUI/Sources/OpenResolvedUrl.swift
+index 948fb4e29..8ead3b879 100644
+--- a/submodules/TelegramUI/Sources/OpenResolvedUrl.swift
++++ b/submodules/TelegramUI/Sources/OpenResolvedUrl.swift
+@@ -524,15 +524,6 @@ func openResolvedUrlImpl(
+                         } else {
+                             presentExpired()
+                         }
+-                    default:
+-                        let joinLinkPreviewController = JoinLinkPreviewController(context: context, link: link, navigateToPeer: { peer, peekData in
+-                            openPeer(peer, .chat(textInputState: nil, subject: nil, peekData: peekData))
+-                        }, parentNavigationController: navigationController, resolvedState: resolvedState)
+-                        if joinLinkPreviewController.navigationPresentation == .flatModal {
+-                            navigationController?.pushViewController(joinLinkPreviewController)
+-                        } else {
+-                            present(joinLinkPreviewController, nil)
+-                        }
+                     }
+                 })
+             } else {
