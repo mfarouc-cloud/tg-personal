@@ -1,0 +1,137 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index 95e1bf21e..c2c107c78 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -385,3 +385,62 @@ public func hboltSonicBulkForward(account: Account, fromPeerId: PeerId, fromThre
+         return process |> then(completion)
+     }
+ }
++
++// MARK: - Selected Bulk: the Sonic producer-consumer pipeline scoped to explicitly selected items.
++
++private func hboltSelectedFilteredSorted(_ messages: [Message]) -> [Message] {
++    var seen = Set<MessageId>()
++    var out: [Message] = []
++    for message in messages {
++        if seen.contains(message.id) {
++            continue
++        }
++        let ok = message.media.contains(where: { $0 is TelegramMediaImage || (($0 as? TelegramMediaFile)?.isVideo ?? false) })
++        if !ok {
++            continue
++        }
++        seen.insert(message.id)
++        out.append(message)
++    }
++    return out.sorted(by: { $0.index < $1.index })
++}
++
++/// Selected Bulk: identical pipeline to Sonic Bulk (bounded pre-cache waves, detached local send,
++/// forced 10-item albums, per-wave eviction, kick-immunity, completion count) but fed only the
++/// explicitly selected message ids — no searchMessages drain of the whole chat.
++public func hboltSelectedBulkForward(account: Account, messageIds: [MessageId], toPeerId: PeerId, toThreadId: Int64?) -> Signal<Never, NoError> {
++    if messageIds.isEmpty {
++        return .complete()
++    }
++    return account.postbox.transaction { transaction -> [Message] in
++        var result: [Message] = []
++        for id in messageIds {
++            if let message = transaction.getMessage(id) {
++                result.append(message)
++            }
++        }
++        return result
++    }
++    |> mapToSignal { rawMessages -> Signal<Never, NoError> in
++        let messages = hboltSelectedFilteredSorted(rawMessages)
++        if messages.isEmpty {
++            return .complete()
++        }
++        let windowItems = 30
++        var waves: [[Message]] = []
++        var index = 0
++        while index < messages.count {
++            waves.append(Array(messages[index ..< min(index + windowItems, messages.count)]))
++            index += windowItems
++        }
++        let counter = HBOLTSonicCounter()
++        let process = hboltSonicProcessWaves(account: account, waves: waves, index: 0, toPeerId: toPeerId, toThreadId: toThreadId, counter: counter)
++        let completion: Signal<Never, NoError> = Signal<Void, NoError>.single(Void())
++        |> mapToSignal { _ -> Signal<Never, NoError> in
++            let text = "Done. Successfully forwarded \(counter.committed) items in \(counter.albums) albums via Selected Bulk."
++            let message: EnqueueMessage = .message(text: text, attributes: [], inlineStickers: [:], mediaReference: nil, threadId: toThreadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: nil, correlationId: nil, bubbleUpEmojiOrStickersets: [])
++            return enqueueMessages(account: account, peerId: toPeerId, messages: [message]) |> ignoreValues
++        }
++        return process |> then(completion)
++    }
++}
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
+index 8652300a5..86a64c3b6 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
+@@ -76,6 +76,11 @@ extension PeerInfoScreenNode {
+             self.hboltPresentBulkMediaForward()
+             return
+         }
++        // HBOLT: selection-toolbar forward (no explicit ids) offers normal forward vs Selected Bulk.
++        if messageIds == nil, let selected = self.state.selectedMessageIds, !selected.isEmpty {
++            self.hboltPresentSelectionForwardChoice(messageIds: selected)
++            return
++        }
+         if let messageIds = messageIds ?? self.state.selectedMessageIds, !messageIds.isEmpty {
+             let peerSelectionController = self.context.sharedContext.makePeerSelectionController(PeerSelectionControllerParams(context: self.context, updatedPresentationData: self.controller?.updatedPresentationData, filter: [.onlyWriteable, .excludeDisabled], hasFilters: true, multipleSelection: true, selectForumThreads: true))
+             peerSelectionController.multiplePeersSelected = { [weak self, weak peerSelectionController] peers, peerMap, messageText, mode, forwardOptions, _ in
+@@ -352,6 +357,53 @@ extension PeerInfoScreenNode {
+         self.controller?.push(peerSelectionController)
+     }
+ 
++    // HBOLT: off the selection toolbar's Forward button — choose normal forward or Selected Bulk.
++    func hboltPresentSelectionForwardChoice(messageIds: Set<EngineMessage.Id>) {
++        let presentationData = self.presentationData
++        let actionSheet = ActionSheetController(presentationData: presentationData)
++        actionSheet.setItemGroups([
++            ActionSheetItemGroup(items: [
++                ActionSheetButtonItem(title: "Forward", color: .accent, action: { [weak self, weak actionSheet] in
++                    actionSheet?.dismissAnimated()
++                    self?.forwardMessages(messageIds: messageIds)
++                }),
++                ActionSheetButtonItem(title: "Selected Bulk (Auto-Albums)", color: .accent, action: { [weak self, weak actionSheet] in
++                    actionSheet?.dismissAnimated()
++                    self?.hboltSelectedBulkStart(messageIds: messageIds)
++                })
++            ]),
++            ActionSheetItemGroup(items: [
++                ActionSheetButtonItem(title: presentationData.strings.Common_Cancel, color: .accent, font: .bold, action: { [weak actionSheet] in
++                    actionSheet?.dismissAnimated()
++                })
++            ])
++        ])
++        self.controller?.present(actionSheet, in: .window(.root))
++    }
++
++    // HBOLT: Selected Bulk — 1-tap from the choice sheet straight to the target picker, strict
++    // 10-item albums, scoped to the explicitly selected items via the Sonic fast-lane pipeline.
++    func hboltSelectedBulkStart(messageIds: Set<EngineMessage.Id>) {
++        guard self.peerId.namespace != Namespaces.Peer.SecretChat else {
++            return
++        }
++        let ids = Array(messageIds)
++        let peerSelectionController = self.context.sharedContext.makePeerSelectionController(PeerSelectionControllerParams(context: self.context, updatedPresentationData: self.controller?.updatedPresentationData, filter: [.onlyWriteable, .excludeDisabled], hasFilters: true, multipleSelection: false, selectForumThreads: true))
++        peerSelectionController.peerSelected = { [weak self, weak peerSelectionController] peer, threadId in
++            guard let strongSelf = self else {
++                return
++            }
++            peerSelectionController?.dismiss()
++            strongSelf.headerNode.navigationButtonContainer.performAction?(.selectionDone, nil, nil)
++            HBOLTBackgroundKeepAlive.shared.start()
++            let _ = (hboltSelectedBulkForward(account: strongSelf.context.account, messageIds: ids, toPeerId: peer.id, toThreadId: threadId)
++            |> afterDisposed {
++                HBOLTBackgroundKeepAlive.shared.stop()
++            }).startStandalone()
++        }
++        self.controller?.push(peerSelectionController)
++    }
++
+     // HBOLT: Sonic Bulk — 1-tap, no Albums/Singles dialog, straight to the target picker. Forwards
+     // ALL media (photos + videos) via the isolated producer-consumer fast-lane pipeline.
+     func hboltSonicBulkStart() {
