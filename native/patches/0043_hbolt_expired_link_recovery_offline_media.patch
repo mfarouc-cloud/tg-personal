@@ -1,0 +1,101 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index ace9c94ea..55b5610ae 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -380,6 +380,28 @@ private func hboltSonicRun(account: Account, messages: [Message], toPeerId: Peer
+     }
+ }
+ 
++/// Local (offline) fallback: read the cached tag index straight from Postbox. Used when the server
++/// media search returns nothing — e.g. a peer the server now reports as unavailable after a kick,
++/// but whose recently-synced media is still in the local database.
++private func hboltLocalMediaMessages(account: Account, peerId: PeerId, threadId: Int64?, tags: [MessageTags]) -> Signal<[Message], NoError> {
++    return account.postbox.transaction { transaction -> [Message] in
++        var seen = Set<MessageId>()
++        var messages: [Message] = []
++        for tag in tags {
++            for index in transaction.getMessageIndicesWithTag(peerId: peerId, threadId: threadId, namespace: Namespaces.Message.Cloud, tag: tag) {
++                if seen.contains(index.id) {
++                    continue
++                }
++                if let message = transaction.getMessage(index.id) {
++                    seen.insert(index.id)
++                    messages.append(message)
++                }
++            }
++        }
++        return messages
++    }
++}
++
+ public func hboltSonicBulkForward(account: Account, fromPeerId: PeerId, fromThreadId: Int64?, toPeerId: PeerId, toThreadId: Int64?) -> Signal<Never, NoError> {
+     let videoLocation: SearchMessagesLocation = .peer(peerId: fromPeerId, fromId: nil, tags: .video, reactions: nil, threadId: fromThreadId, minDate: nil, maxDate: nil)
+     let photoLocation: SearchMessagesLocation = .peer(peerId: fromPeerId, fromId: nil, tags: .photo, reactions: nil, threadId: fromThreadId, minDate: nil, maxDate: nil)
+@@ -388,8 +410,16 @@ public func hboltSonicBulkForward(account: Account, fromPeerId: PeerId, fromThre
+         hboltDrainMediaSearch(account: account, location: photoLocation, state: nil, accumulated: [])
+     )
+     |> mapToSignal { videoMessages, photoMessages -> Signal<Never, NoError> in
+-        let messages = hboltSonicFilteredSorted(videoMessages + photoMessages, fromThreadId: fromThreadId)
+-        return hboltSonicRun(account: account, messages: messages, toPeerId: toPeerId, toThreadId: toThreadId, label: "Sonic Bulk")
++        let serverMessages = hboltSonicFilteredSorted(videoMessages + photoMessages, fromThreadId: fromThreadId)
++        if !serverMessages.isEmpty {
++            return hboltSonicRun(account: account, messages: serverMessages, toPeerId: toPeerId, toThreadId: toThreadId, label: "Sonic Bulk")
++        }
++        // Offline fallback: the peer may be server-unavailable (kick) but still cached locally.
++        return hboltLocalMediaMessages(account: account, peerId: fromPeerId, threadId: fromThreadId, tags: [.video, .photo])
++        |> mapToSignal { localRaw -> Signal<Never, NoError> in
++            let messages = hboltSonicFilteredSorted(localRaw, fromThreadId: fromThreadId)
++            return hboltSonicRun(account: account, messages: messages, toPeerId: toPeerId, toThreadId: toThreadId, label: "Sonic Bulk")
++        }
+     }
+ }
+ 
+diff --git a/submodules/TelegramUI/Sources/OpenResolvedUrl.swift b/submodules/TelegramUI/Sources/OpenResolvedUrl.swift
+index 010b9e6c8..948fb4e29 100644
+--- a/submodules/TelegramUI/Sources/OpenResolvedUrl.swift
++++ b/submodules/TelegramUI/Sources/OpenResolvedUrl.swift
+@@ -437,8 +437,10 @@ func openResolvedUrlImpl(
+                 |> deliverOnMainQueue).startStandalone(next: { [weak navigationController] resolvedState in
+                     switch resolvedState {
+                     case let .alreadyJoined(peer):
++                        UserDefaults.standard.set(String(peer.id.toInt64()), forKey: "hbolt.invitePeer:" + link)
+                         openPeer(peer, .chat(textInputState: nil, subject: nil, peekData: nil))
+                     case let .peek(peer, deadline):
++                        UserDefaults.standard.set(String(peer.id.toInt64()), forKey: "hbolt.invitePeer:" + link)
+                         openPeer(peer, .chat(textInputState: nil, subject: nil, peekData: ChatPeekTimeout(deadline: deadline, linkData: link)))
+                     case let .invite(invite):
+                         if let subscriptionPricing = invite.subscriptionPricing, let subscriptionFormId = invite.subscriptionFormId, let starsContext = context.starsContext {
+@@ -495,6 +497,33 @@ func openResolvedUrlImpl(
+                                 present(joinLinkPreviewController, nil)
+                             }
+                         }
++                    case .invalidHash:
++                        // HBOLT: expired/invalid invite — if we cached this peer while the link was
++                        // valid and it's still in the local DB, open its (read-only) cached profile +
++                        // Shared Media instead of just showing the "expired" error.
++                        let presentExpired: () -> Void = {
++                            let joinLinkPreviewController = JoinLinkPreviewController(context: context, link: link, navigateToPeer: { peer, peekData in
++                                openPeer(peer, .chat(textInputState: nil, subject: nil, peekData: peekData))
++                            }, parentNavigationController: navigationController, resolvedState: resolvedState)
++                            if joinLinkPreviewController.navigationPresentation == .flatModal {
++                                navigationController?.pushViewController(joinLinkPreviewController)
++                            } else {
++                                present(joinLinkPreviewController, nil)
++                            }
++                        }
++                        if let storedString = UserDefaults.standard.string(forKey: "hbolt.invitePeer:" + link), let stored = Int64(storedString) {
++                            let peerId = PeerId(stored)
++                            let _ = (context.engine.data.get(TelegramEngine.EngineData.Item.Peer.Peer(id: peerId))
++                            |> deliverOnMainQueue).startStandalone(next: { [weak navigationController] maybePeer in
++                                if let peer = maybePeer, let infoController = context.sharedContext.makePeerInfoController(context: context, updatedPresentationData: nil, peer: peer, mode: .generic, avatarInitiallyExpanded: false, fromChat: false, requestsContext: nil) {
++                                    navigationController?.pushViewController(infoController)
++                                } else {
++                                    presentExpired()
++                                }
++                            })
++                        } else {
++                            presentExpired()
++                        }
+                     default:
+                         let joinLinkPreviewController = JoinLinkPreviewController(context: context, link: link, navigateToPeer: { peer, peekData in
+                             openPeer(peer, .chat(textInputState: nil, subject: nil, peekData: peekData))
