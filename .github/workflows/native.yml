@@ -33,8 +33,9 @@ jobs:
           REF=$(grep -v '^#' native/upstream.txt | head -1)
           git init tgios && cd tgios
           git remote add origin https://github.com/TelegramMessenger/Telegram-iOS.git
-          git fetch --depth 1 origin "$REF" || git fetch --depth 50 origin master
-          git checkout FETCH_HEAD 2>/dev/null || git checkout "$REF"
+          # Patches are only valid on the pinned commit: fail loudly instead of silently building master.
+          git fetch --depth 1 origin "$REF" || { echo "::error::cannot fetch pinned Telegram-iOS commit $REF (native/upstream.txt)"; exit 1; }
+          git checkout FETCH_HEAD
           git submodule update --init --recursive --depth 1 --jobs 8
 
       - name: Apply HBOLT changes

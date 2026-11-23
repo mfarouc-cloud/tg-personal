@@ -1,0 +1,108 @@
+diff --git a/submodules/GalleryUI/Sources/GalleryController.swift b/submodules/GalleryUI/Sources/GalleryController.swift
+index dd3427a..953d9c6 100644
+--- a/submodules/GalleryUI/Sources/GalleryController.swift
++++ b/submodules/GalleryUI/Sources/GalleryController.swift
+@@ -17,6 +17,7 @@ import ScreenCaptureDetection
+ import UndoUI
+ import TranslateUI
+ import UrlWhitelist
++import GlassBackgroundComponent
+ 
+ private func tagsForMessage(_ message: Message) -> MessageTags? {
+     //TODO:rewrite to take all media (effectiveMedia returns all rich-text media; we stop at the first)
+@@ -714,6 +715,7 @@ public class GalleryController: ViewController, StandalonePresentableController,
+     private let context: AccountContext
+     private var presentationData: PresentationData
+     private let source: GalleryControllerItemSource
++    private var hboltHoldsNativeGlass = false
+     private let invertItemOrder: Bool
+     
+     private let titleView: GalleryTitleView
+@@ -827,6 +829,22 @@ public class GalleryController: ViewController, StandalonePresentableController,
+             openActionOptionsImpl?(action, message)
+         }
+         
++        // HBOLT 0046: opening media from any group or channel automatically drops the "fake" (custom)
++        // glass for this viewer's chrome — taken before the title view and items build their glass.
++        let hboltSourcePeerId: PeerId
++        switch source {
++        case let .peerMessagesAtId(messageId, _, _, _):
++            hboltSourcePeerId = messageId.peerId
++        case let .standaloneMessage(message, _):
++            hboltSourcePeerId = message.id.peerId
++        case let .custom(_, messageId, _):
++            hboltSourcePeerId = messageId.peerId
++        }
++        if hboltSourcePeerId.namespace == Namespaces.Peer.CloudGroup || hboltSourcePeerId.namespace == Namespaces.Peer.CloudChannel {
++            GlassBackgroundView.hboltBeginNativeGlass()
++            self.hboltHoldsNativeGlass = true
++        }
++
+         self.titleView = GalleryTitleView(context: context, presentationData: self.presentationData)
+         
+         super.init(navigationBarPresentationData: NavigationBarPresentationData(theme: GalleryController.darkNavigationTheme, strings: NavigationBarStrings(presentationStrings: self.presentationData.strings)))
+@@ -1459,6 +1477,9 @@ public class GalleryController: ViewController, StandalonePresentableController,
+     }
+     
+     deinit {
++        if self.hboltHoldsNativeGlass {
++            GlassBackgroundView.hboltEndNativeGlass()
++        }
+         if let initialOrientation = self.initialOrientation {
+             self.context.sharedContext.applicationBindings.forceOrientation(initialOrientation)
+         }
+diff --git a/submodules/TelegramUI/Components/GlassBackgroundComponent/Sources/GlassBackgroundComponent.swift b/submodules/TelegramUI/Components/GlassBackgroundComponent/Sources/GlassBackgroundComponent.swift
+index 6e3e22d..6a38f0a 100644
+--- a/submodules/TelegramUI/Components/GlassBackgroundComponent/Sources/GlassBackgroundComponent.swift
++++ b/submodules/TelegramUI/Components/GlassBackgroundComponent/Sources/GlassBackgroundComponent.swift
+@@ -499,9 +499,40 @@ public class GlassBackgroundView: UIView {
+     public private(set) var params: Params?
+         
+     public static var useCustomGlassImpl: Bool = false
++
++    // HBOLT 0046: ref-counted override that forces the native (iOS 26 UIGlassEffect) glass while a
++    // media viewer for a group/channel is open, even if the "Fake glass" setting is on. The setting
++    // is read when a glass view is created, so views built while the override is held are native.
++    // Main-thread only (UI construction); begin/end hop to main when called elsewhere.
++    private static var hboltNativeGlassOverrideCount: Int = 0
++
++    public static var hboltUseCustomGlass: Bool {
++        return GlassBackgroundView.useCustomGlassImpl && GlassBackgroundView.hboltNativeGlassOverrideCount == 0
++    }
++
++    public static func hboltBeginNativeGlass() {
++        if Thread.isMainThread {
++            GlassBackgroundView.hboltNativeGlassOverrideCount += 1
++        } else {
++            DispatchQueue.main.async {
++                GlassBackgroundView.hboltNativeGlassOverrideCount += 1
++            }
++        }
++    }
++
++    public static func hboltEndNativeGlass() {
++        let end: () -> Void = {
++            GlassBackgroundView.hboltNativeGlassOverrideCount = max(0, GlassBackgroundView.hboltNativeGlassOverrideCount - 1)
++        }
++        if Thread.isMainThread {
++            end()
++        } else {
++            DispatchQueue.main.async(execute: end)
++        }
++    }
+     
+     public override init(frame: CGRect) {
+-        if #available(iOS 26.0, *), !GlassBackgroundView.useCustomGlassImpl {
++        if #available(iOS 26.0, *), !GlassBackgroundView.hboltUseCustomGlass {
+             self.legacyView = nil
+             self.legacyHighlightContainerView = nil
+             self.legacyHighlightClippingContext = nil
+@@ -861,7 +892,7 @@ public final class GlassBackgroundContainerView: UIView {
+     }
+     
+     public init(spacing: CGFloat = 7.0) {
+-        if #available(iOS 26.0, *), !GlassBackgroundView.useCustomGlassImpl {
++        if #available(iOS 26.0, *), !GlassBackgroundView.hboltUseCustomGlass {
+             let effect = UIGlassContainerEffect()
+             effect.spacing = spacing
+             let nativeView = UIVisualEffectView(effect: effect)
