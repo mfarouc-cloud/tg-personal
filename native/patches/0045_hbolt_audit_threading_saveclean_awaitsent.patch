@@ -1,0 +1,328 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index 55b5610..1991c6a 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -25,6 +25,10 @@ public enum HBOLTBulkMediaKind {
+     case video
+ }
+ 
++// HBOLT 0045: all synchronous file copies (detach from cache) run here, never on the caller's,
++// the Postbox transaction or the MediaBox queue — a multi-hundred-MB video copy used to stall them.
++private let hboltBulkWorkQueue = Queue(name: "HBOLTBulkWork", qos: .utility)
++
+ private func hboltStripProvenance(_ attributes: [MessageAttribute]) -> [MessageAttribute] {
+     return attributes.filter { attr in
+         !(attr is SourceReferenceMessageAttribute)
+@@ -34,7 +38,23 @@ private func hboltStripProvenance(_ attributes: [MessageAttribute]) -> [MessageA
+             && !(attr is ReplyMarkupMessageAttribute)
+             && !(attr is ViewCountMessageAttribute)
+             && !(attr is ForwardSourceInfoAttribute)
++            && !(attr is AutoclearTimeoutMessageAttribute)
++            && !(attr is ConsumableContentMessageAttribute)
++    }
++}
++
++/// HBOLT 0045: completes only once every given message has left the unsent queue (sent, or marked
++/// failed). enqueueMessages() completes as soon as items are QUEUED, so without this the background
++/// keep-alive (bound to the bulk signal's lifetime) stopped exactly when the long upload phase began.
++private func hboltAwaitSent(account: Account, ids: [MessageId]) -> Signal<Never, NoError> {
++    let pending = Set(ids)
++    if pending.isEmpty {
++        return .complete()
+     }
++    return account.postbox.unsentMessageIdsView()
++    |> filter { view in view.ids.isDisjoint(with: pending) }
++    |> take(1)
++    |> ignoreValues
+ }
+ 
+ private func hboltBulkResource(_ media: Media) -> (MediaResource, MediaResourceUserContentType)? {
+@@ -182,16 +202,6 @@ private func hboltFilteredSortedMedia(_ messages: [Message], fromThreadId: Int64
+     return filtered.sorted(by: { $0.index < $1.index })
+ }
+ 
+-/// Full, untruncated set of thread-scoped photo/video message ids, drained from the server search.
+-public func hboltBulkMediaMessageIds(account: Account, peerId: PeerId, threadId: Int64?, kind: HBOLTBulkMediaKind) -> Signal<[MessageId], NoError> {
+-    let tag: MessageTags = (kind == .photo) ? .photo : .video
+-    let location: SearchMessagesLocation = .peer(peerId: peerId, fromId: nil, tags: tag, reactions: nil, threadId: threadId, minDate: nil, maxDate: nil)
+-    return hboltDrainMediaSearch(account: account, location: location, state: nil, accumulated: [])
+-    |> map { messages in
+-        return hboltFilteredSortedMedia(messages, fromThreadId: threadId, kind: kind).map { $0.id }
+-    }
+-}
+-
+ private func hboltBulkDetachedMessage(media: Media, source: Message, toThreadId: Int64?, groupingKey: Int64?) -> EnqueueMessage {
+     return .message(text: source.text, attributes: hboltStripProvenance(source.attributes), inlineStickers: [:], mediaReference: .standalone(media: media), threadId: toThreadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: groupingKey, correlationId: nil, bubbleUpEmojiOrStickersets: [])
+ }
+@@ -207,6 +217,15 @@ private func hboltBulkCompletionSignal(account: Account, toPeerId: PeerId, toThr
+     return enqueueMessages(account: account, peerId: toPeerId, messages: [message]) |> ignoreValues
+ }
+ 
++/// HBOLT 0045: enqueue one batch and record the resulting local ids so the run can await delivery.
++private func hboltEnqueueTracked(account: Account, peerId: PeerId, messages: [EnqueueMessage], task: HBOLTSonicTask) -> Signal<Never, NoError> {
++    return enqueueMessages(account: account, peerId: peerId, messages: messages)
++    |> map { ids -> Void in
++        task.enqueuedIds.append(contentsOf: ids.compactMap { $0 })
++    }
++    |> ignoreValues
++}
++
+ /// Bulk-forward every photo/video of a thread to a target. Pre-caches the full drained set first,
+ /// then sends each item detached from local cache, chunked into strict <=10 albums, and finishes
+ /// with a completion message reporting the actual count.
+@@ -222,7 +241,9 @@ public func hboltBulkForwardThreadMedia(account: Account, fromPeerId: PeerId, fr
+         // Phase 1: grab everything to disk while access is valid.
+         let precache = hboltBulkPrecacheAll(account: account, messages: messages, concurrency: 6)
+         // Phase 2 (after pre-cache): dispatch strictly from local cache, kick-immune.
++        let task = HBOLTSonicTask()
+         let dispatch = Signal<Void, NoError>.single(Void())
++        |> deliverOn(hboltBulkWorkQueue)
+         |> mapToSignal { _ -> Signal<Never, NoError> in
+             // Keep only the items that actually made it into the cache before any revocation.
+             var detached: [(Media, Message)] = []
+@@ -247,7 +268,7 @@ public func hboltBulkForwardThreadMedia(account: Account, fromPeerId: PeerId, fr
+                     batch.append(hboltBulkDetachedMessage(media: detached[i].0, source: detached[i].1, toThreadId: toThreadId, groupingKey: groupId))
+                 }
+                 if !batch.isEmpty {
+-                    chunkSignals.append(enqueueMessages(account: account, peerId: toPeerId, messages: batch) |> ignoreValues)
++                    chunkSignals.append(hboltEnqueueTracked(account: account, peerId: toPeerId, messages: batch, task: task))
+                     if asAlbums {
+                         albumCount += 1
+                     }
+@@ -258,8 +279,13 @@ public func hboltBulkForwardThreadMedia(account: Account, fromPeerId: PeerId, fr
+             for chunkSignal in chunkSignals {
+                 chain = chain |> then(chunkSignal)
+             }
++            let awaitSent: Signal<Never, NoError> = Signal<Void, NoError>.single(Void())
++            |> mapToSignal { _ -> Signal<Never, NoError> in
++                return hboltAwaitSent(account: account, ids: task.enqueuedIds)
++            }
+             return chain
+             |> then(hboltBulkCompletionSignal(account: account, toPeerId: toPeerId, toThreadId: toThreadId, sentCount: sentCount, albumCount: albumCount, asAlbums: asAlbums))
++            |> then(awaitSent)
+         }
+         return precache |> then(dispatch)
+     }
+@@ -303,6 +329,7 @@ private final class HBOLTSonicTask {
+     var albums = 0
+     var total = 0
+     var resourceIds: [MediaResourceId] = []
++    var enqueuedIds: [MessageId] = []
+ }
+ 
+ // Retains orphan-eviction cleanups fired from afterDisposed until they finish.
+@@ -321,22 +348,26 @@ private func hboltSonicStreamChunks(account: Account, messages: [Message], index
+     |> take(1)
+     |> ignoreValues
+     let dispatch: Signal<Never, NoError> = Signal<Void, NoError>.single(Void())
++    |> deliverOn(hboltBulkWorkQueue)
+     |> mapToSignal { _ -> Signal<Never, NoError> in
+-        let groupId: Int64? = chunk.count >= 2 ? Int64(bitPattern: UInt64.random(in: UInt64.min ... UInt64.max)) : nil
+-        var batch: [EnqueueMessage] = []
++        // HBOLT 0045: detach first, THEN decide grouping from what actually made it — a chunk where
++        // only one item survived must not carry a groupingKey (single-item "album").
++        var detached: [(Media, Message)] = []
+         var evictIds: [MediaResourceId] = []
+         for message in chunk {
+             if let media = hboltBulkDetachCached(account: account, message: message) {
+-                batch.append(hboltBulkDetachedMessage(media: media, source: message, toThreadId: toThreadId, groupingKey: groupId))
++                detached.append((media, message))
+                 task.committed += 1
+                 if let rid = hboltSonicResourceId(message) {
+                     evictIds.append(rid)
+                 }
+             }
+         }
++        let groupId: Int64? = detached.count >= 2 ? Int64(bitPattern: UInt64.random(in: UInt64.min ... UInt64.max)) : nil
++        let batch: [EnqueueMessage] = detached.map { hboltBulkDetachedMessage(media: $0.0, source: $0.1, toThreadId: toThreadId, groupingKey: groupId) }
+         var send: Signal<Never, NoError> = .complete()
+         if !batch.isEmpty {
+-            send = enqueueMessages(account: account, peerId: toPeerId, messages: batch) |> ignoreValues
++            send = hboltEnqueueTracked(account: account, peerId: toPeerId, messages: batch, task: task)
+             task.albums += 1
+         }
+         let evict: Signal<Never, NoError> = evictIds.isEmpty ? .complete() : (account.postbox.mediaBox.removeCachedResources(evictIds, force: true) |> ignoreValues)
+@@ -370,7 +401,11 @@ private func hboltSonicRun(account: Account, messages: [Message], toPeerId: Peer
+         let message: EnqueueMessage = .message(text: text, attributes: [], inlineStickers: [:], mediaReference: nil, threadId: toThreadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: nil, correlationId: nil, bubbleUpEmojiOrStickersets: [])
+         return enqueueMessages(account: account, peerId: toPeerId, messages: [message]) |> ignoreValues
+     }
+-    return (process |> then(completion))
++    let awaitSent: Signal<Never, NoError> = Signal<Void, NoError>.single(Void())
++    |> mapToSignal { _ -> Signal<Never, NoError> in
++        return hboltAwaitSent(account: account, ids: task.enqueuedIds)
++    }
++    return (process |> then(completion) |> then(awaitSent))
+     |> afterDisposed {
+         // Orphan evacuation: free every downloaded payload for this task, even if kicked/cancelled
+         // mid-download (removeCachedResources is idempotent for chunks already evicted above).
+@@ -472,12 +507,18 @@ public func hboltSaveCleanToSavedMessages(account: Account, message: Message) ->
+         return .single(false)
+     }
+     return hboltBulkPrecache(account: account, message: message)
++    |> deliverOn(hboltBulkWorkQueue)
+     |> mapToSignal { _ -> Signal<Bool, NoError> in
+         guard let media = hboltBulkDetachCached(account: account, message: message) else {
+             return .single(false)
+         }
++        // HBOLT 0045: incoming view-once / timed media is stored with AutoclearTimeoutMessageAttribute
++        // (not Autoremove). Left in place it was re-uploaded with ttl_seconds, so the "clean" copy in
++        // Saved Messages self-destructed again. Strip both timer kinds + the consumable marker.
+         let attributes = message.attributes.filter { attr in
+             !(attr is AutoremoveTimeoutMessageAttribute)
++                && !(attr is AutoclearTimeoutMessageAttribute)
++                && !(attr is ConsumableContentMessageAttribute)
+                 && !(attr is SourceReferenceMessageAttribute)
+                 && !(attr is ForwardCountMessageAttribute)
+                 && !(attr is ReplyMessageAttribute)
+diff --git a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+index 65d2d40..cc7c250 100644
+--- a/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTProtectedForward.swift
+@@ -43,6 +43,9 @@ extension HBOLTSettings {
+     }
+ }
+ 
++// HBOLT 0045: synchronous detach copies run here instead of on the Postbox transaction queue.
++private let hboltProtectedWorkQueue = Queue(name: "HBOLTProtectedWork", qos: .userInitiated)
++
+ // Keeps async download-then-send batches alive until they finish.
+ private let hboltDeferredSends = DisposableSet()
+ 
+@@ -203,6 +206,7 @@ private func hboltDownloadThenSendGroup(account: Account, peerId: PeerId, items:
+     let readies = items.map { hboltMediaReadySignal(account: account, message: $0.message) }
+     let send = combineLatest(readies)
+     |> take(1)
++    |> deliverOn(hboltProtectedWorkQueue)
+     |> mapToSignal { _ -> Signal<[MessageId?], NoError> in
+         var converted: [EnqueueMessage] = []
+         for item in items {
+@@ -218,33 +222,6 @@ private func hboltDownloadThenSendGroup(account: Account, peerId: PeerId, items:
+     hboltDeferredSends.add(send.start())
+ }
+ 
+-/// HBOLT bulk entry: re-upload a chunk of protected messages as ONE intact album under a FORCED
+-/// grouping key (the source's own groupedId is ignored). Downloads every item's bytes (cache-first,
+-/// bounded) then enqueues the whole chunk together so it lands as a single album of up to 10. Returns
+-/// a Signal so the caller can sequence chunks instead of downloading everything at once.
+-func hboltBulkProtectedAlbumSignal(account: Account, toPeerId: PeerId, toThreadId: Int64?, messages: [Message], forcedGroupingKey: Int64?) -> Signal<Never, NoError> {
+-    if messages.isEmpty {
+-        return .complete()
+-    }
+-    let items = messages.map { HBOLTDeferredForward(message: $0, threadId: toThreadId, attributes: [], correlationId: nil, localGroupingKey: forcedGroupingKey) }
+-    let readies = items.map { hboltMediaReadySignal(account: account, message: $0.message) }
+-    return combineLatest(readies)
+-    |> take(1)
+-    |> mapToSignal { _ -> Signal<Never, NoError> in
+-        var converted: [EnqueueMessage] = []
+-        for item in items {
+-            if let message = hboltConvertForward(account: account, message: item.message, threadId: item.threadId, attributes: item.attributes, correlationId: item.correlationId, localGroupingKey: item.localGroupingKey, viewOnce: false) {
+-                converted.append(message)
+-            }
+-        }
+-        if converted.isEmpty {
+-            return .complete()
+-        }
+-        return enqueueMessages(account: account, peerId: toPeerId, messages: converted)
+-        |> ignoreValues
+-    }
+-}
+-
+ /// HBOLT: re-send forwards from protected (noforwards) chats as fresh standalone messages.
+ /// Cache-first and album-safe: a fully-cached album is sent instantly as one grouped batch; an
+ /// album with any uncached item is deferred as a whole and sent together once downloaded. Topic
+@@ -270,6 +247,7 @@ func hboltRewriteProtectedForwards(account: Account, peerId: PeerId, messages: [
+             return nil
+         }
+     }
++    |> deliverOn(hboltProtectedWorkQueue)
+     |> map { sources -> [EnqueueMessage] in
+         // One shared local grouping key per source album.
+         var groupingKeys: [Int64: Int64] = [:]
+@@ -372,6 +350,7 @@ func hboltRewriteGroupAlbums(account: Account, peerId: PeerId, messages: [Enqueu
+             return nil
+         }
+     }
++    |> deliverOn(hboltProtectedWorkQueue)
+     |> map { sources -> [EnqueueMessage] in
+         var mediaIndices: [Int] = []
+         for (index, item) in messages.enumerated() {
+@@ -428,6 +407,7 @@ func hboltRewriteViewOnce(account: Account, peerId: PeerId, messages: [EnqueueMe
+             return nil
+         }
+     }
++    |> deliverOn(hboltProtectedWorkQueue)
+     |> map { sources -> [EnqueueMessage] in
+         var result: [EnqueueMessage] = []
+         for (index, item) in messages.enumerated() {
+diff --git a/submodules/TelegramCore/Sources/HBOLTSettings.swift b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+index bd26549..aed1d35 100644
+--- a/submodules/TelegramCore/Sources/HBOLTSettings.swift
++++ b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+@@ -124,15 +124,34 @@ public enum HBOLTSettings {
+     }
+ 
+     /// Expired-link recovery: invite hash → peer id seen earlier for that link.
++    // HBOLT 0045: values are stored as String (same fix as hbolt.protectedPeers): a whole-dictionary
++    // `as? [String: Int64]` cast of the plist-decoded NSNumber values is not reliable across launches,
++    // and one failed cast both hid every entry and made the next write wipe the cache.
++    // Reads accept the legacy NSNumber form too, so caches written by older builds keep working.
++    private static func inviteCacheMap() -> [String: String] {
++        guard let raw = defaults.dictionary(forKey: "hbolt.inviteCache") else {
++            return [:]
++        }
++        var map: [String: String] = [:]
++        for (key, value) in raw {
++            if let string = value as? String, Int64(string) != nil {
++                map[key] = string
++            } else if let number = value as? NSNumber {
++                map[key] = String(number.int64Value)
++            }
++        }
++        return map
++    }
++
+     public static func rememberInvite(hash: String, peerId: Int64) {
+-        var map = defaults.dictionary(forKey: "hbolt.inviteCache") as? [String: Int64] ?? [:]
+-        map[hash] = peerId
+-        if map.count > 5000 { map.removeValue(forKey: map.keys.first!) }
++        var map = inviteCacheMap()
++        map[hash] = String(peerId)
++        if map.count > 5000, let key = map.keys.first(where: { $0 != hash }) { map.removeValue(forKey: key) }
+         defaults.set(map, forKey: "hbolt.inviteCache")
+     }
+ 
+     public static func rememberedInvite(hash: String) -> Int64? {
+-        return (defaults.dictionary(forKey: "hbolt.inviteCache") as? [String: Int64])?[hash]
++        return inviteCacheMap()[hash].flatMap { Int64($0) }
+     }
+ 
+     /// Ghost Mode: never appear online, never send "typing…", never send read receipts.
+diff --git a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+index a06ccb9..877305a 100644
+--- a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
++++ b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+@@ -1359,7 +1359,9 @@ func contextMenuForChatPresentationInterfaceState(chatPresentationInterfaceState
+                 let _ = enqueueMessages(account: context.account, peerId: context.account.peerId, messages: enqueue).startStandalone()
+             })))
+         }
+-        if message.attributes.contains(where: { ($0 as? AutoremoveTimeoutMessageAttribute)?.timeout == viewOnceTimeout }) && message.media.contains(where: { $0 is TelegramMediaImage || $0 is TelegramMediaFile }) {
++        // HBOLT 0045: incoming view-once / timed media carries AutoclearTimeoutMessageAttribute, not
++        // Autoremove, so the old Autoremove-only check never showed this item for received media.
++        if let hboltTimer = message.minAutoremoveOrClearTimeout, hboltTimer == viewOnceTimeout || hboltTimer <= 60, message.media.contains(where: { $0 is TelegramMediaImage || $0 is TelegramMediaFile }) {
+             actions.append(.action(ContextMenuActionItem(text: "🫧 Save Clean to Saved Messages", icon: { theme in
+                 return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Download"), color: theme.actionSheet.primaryTextColor)
+             }, action: { c, f in
+diff --git a/submodules/TelegramUI/Sources/OpenResolvedUrl.swift b/submodules/TelegramUI/Sources/OpenResolvedUrl.swift
+index 8ead3b8..46a02c1 100644
+--- a/submodules/TelegramUI/Sources/OpenResolvedUrl.swift
++++ b/submodules/TelegramUI/Sources/OpenResolvedUrl.swift
+@@ -511,7 +511,8 @@ func openResolvedUrlImpl(
+                                 present(joinLinkPreviewController, nil)
+                             }
+                         }
+-                        if let storedString = UserDefaults.standard.string(forKey: "hbolt.invitePeer:" + link), let stored = Int64(storedString) {
++                        // HBOLT 0045: honour the "Expired links recovery" switch here too.
++                        if HBOLTSettings.linkRecovery, let storedString = UserDefaults.standard.string(forKey: "hbolt.invitePeer:" + link), let stored = Int64(storedString) {
+                             let peerId = PeerId(stored)
+                             let _ = (context.engine.data.get(TelegramEngine.EngineData.Item.Peer.Peer(id: peerId))
+                             |> deliverOnMainQueue).startStandalone(next: { [weak navigationController] maybePeer in

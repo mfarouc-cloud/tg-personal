@@ -1,0 +1,30 @@
+name: HBOLT native patch check
+
+# Cheap Linux dry-run of the full native patch sequence on the pinned Telegram-iOS commit.
+# Catches ordering/context conflicts in ~1 min before the multi-hour macOS build.
+on:
+  pull_request:
+    paths: ["native/**", ".github/workflows/native*.yml"]
+  push:
+    branches-ignore: [main]
+    paths: ["native/**", ".github/workflows/native*.yml"]
+  workflow_dispatch:
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch pinned Telegram-iOS (blobless, sparse — only patched paths)
+        run: |
+          REF=$(grep -v '^#' native/upstream.txt | head -1)
+          git init -q tgios && cd tgios
+          git remote add origin https://github.com/TelegramMessenger/Telegram-iOS.git
+          { grep -h '^+++ b/' ../native/patches/*.patch | sed 's#^+++ b/#/#; s#\t.*$##'; printf '/Telegram/BUILD\n/Telegram/Telegram-iOS/\n'; } | sort -u | git sparse-checkout set --no-cone --stdin
+          git fetch -q --depth 1 --filter=blob:none origin "$REF" || { echo "::error::cannot fetch pinned commit $REF"; exit 1; }
+          git checkout -q FETCH_HEAD
+
+      - name: Apply HBOLT changes (same script the IPA build uses)
+        run: native/apply-hbolt.sh tgios

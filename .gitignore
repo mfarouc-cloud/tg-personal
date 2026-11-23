@@ -5,3 +5,5 @@ dist/
 build/
 Payload/
 *.ipa
+ipa-out/
+__pycache__/
