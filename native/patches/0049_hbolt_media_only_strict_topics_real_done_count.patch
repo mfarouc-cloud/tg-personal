@@ -1,0 +1,215 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index 1b95054..1605638 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -46,6 +46,19 @@ private func hboltStripProvenance(_ attributes: [MessageAttribute]) -> [MessageA
+ /// HBOLT 0045: completes only once every given message has left the unsent queue (sent, or marked
+ /// failed). enqueueMessages() completes as soon as items are QUEUED, so without this the background
+ /// keep-alive (bound to the bulk signal's lifetime) stopped exactly when the long upload phase began.
++/// HBOLT 0049: how many of `ids` actually went out (still present and not marked Failed).
++private func hboltDeliveredCount(account: Account, ids: [MessageId]) -> Signal<Int, NoError> {
++    return account.postbox.transaction { transaction -> Int in
++        var count = 0
++        for id in ids {
++            if let message = transaction.getMessage(id), !message.flags.contains(.Failed) {
++                count += 1
++            }
++        }
++        return count
++    }
++}
++
+ private func hboltAwaitSent(account: Account, ids: [MessageId]) -> Signal<Never, NoError> {
+     let pending = Set(ids)
+     if pending.isEmpty {
+@@ -286,9 +299,17 @@ public func hboltBulkForwardThreadMedia(account: Account, fromPeerId: PeerId, fr
+             |> mapToSignal { _ -> Signal<Never, NoError> in
+                 return hboltAwaitSent(account: account, ids: task.enqueuedIds)
+             }
++            let completion: Signal<Never, NoError> = Signal<Void, NoError>.single(Void())
++            |> mapToSignal { _ -> Signal<Int, NoError> in
++                return hboltDeliveredCount(account: account, ids: task.enqueuedIds)
++            }
++            |> mapToSignal { delivered -> Signal<Never, NoError> in
++                return hboltBulkCompletionSignal(account: account, toPeerId: toPeerId, toThreadId: toThreadId, sentCount: delivered, albumCount: albumCount, asAlbums: asAlbums)
++            }
++            let _ = sentCount
+             return chain
+-            |> then(hboltBulkCompletionSignal(account: account, toPeerId: toPeerId, toThreadId: toThreadId, sentCount: sentCount, albumCount: albumCount, asAlbums: asAlbums))
+             |> then(awaitSent)
++            |> then(completion)
+         }
+         return precache |> then(dispatch)
+     }
+@@ -393,22 +414,28 @@ private func hboltSonicRun(account: Account, messages: [Message], toPeerId: Peer
+         return hboltBulkCompletionSignal(account: account, toPeerId: toPeerId, toThreadId: toThreadId, sentCount: 0, albumCount: 0, asAlbums: true)
+     }
+     let process = hboltSonicStreamChunks(account: account, messages: messages, index: 0, toPeerId: toPeerId, toThreadId: toThreadId, task: task)
+-    let completion: Signal<Never, NoError> = Signal<Void, NoError>.single(Void())
++    let awaitSent: Signal<Never, NoError> = Signal<Void, NoError>.single(Void())
+     |> mapToSignal { _ -> Signal<Never, NoError> in
+-        let text: String
++        return hboltAwaitSent(account: account, ids: task.enqueuedIds)
++    }
++    // HBOLT 0049: report the ACTUAL delivered count, measured after the uploads finished.
++    let completion: Signal<Never, NoError> = Signal<Void, NoError>.single(Void())
++    |> mapToSignal { _ -> Signal<Int, NoError> in
++        return hboltDeliveredCount(account: account, ids: task.enqueuedIds)
++    }
++    |> mapToSignal { delivered -> Signal<Never, NoError> in
++        let failed = task.enqueuedIds.count - delivered
++        var text = "Done. Sent \(delivered) of \(task.total) items in \(task.albums) albums via \(label)."
++        if failed > 0 {
++            text += " \(failed) failed to send."
++        }
+         if task.committed < task.total {
+-            text = "Done (Rescued). Successfully forwarded \(task.committed) cached items before access revocation."
+-        } else {
+-            text = "Done. Successfully forwarded \(task.committed) items in \(task.albums) albums via \(label)."
++            text += " \(task.total - task.committed) could not be cached (access revoked or unavailable)."
+         }
+         let message: EnqueueMessage = .message(text: text, attributes: [], inlineStickers: [:], mediaReference: nil, threadId: toThreadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: nil, correlationId: nil, bubbleUpEmojiOrStickersets: [])
+         return enqueueMessages(account: account, peerId: toPeerId, messages: [message]) |> ignoreValues
+     }
+-    let awaitSent: Signal<Never, NoError> = Signal<Void, NoError>.single(Void())
+-    |> mapToSignal { _ -> Signal<Never, NoError> in
+-        return hboltAwaitSent(account: account, ids: task.enqueuedIds)
+-    }
+-    return (process |> then(completion) |> then(awaitSent))
++    return (process |> then(awaitSent) |> then(completion))
+     |> afterDisposed {
+         // Orphan evacuation: free every downloaded payload for this task, even if kicked/cancelled
+         // mid-download (removeCachedResources is idempotent for chunks already evicted above).
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift b/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift
+index 2023e72..9644210 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift
+@@ -5,16 +5,28 @@ import SwiftSignalKit
+ public extension HBOLTSettings {
+     static var bulkSelect: Bool { return value("hbolt.bulkSelect") }
+ 
+-    /// Ids of every locally stored message in the chat from `start` up to the newest one (max 5000).
++    /// HBOLT 0049: media-only tags used by every "select" helper; plain text never qualifies.
++    private static let hboltMediaTags: [MessageTags] = [.photoOrVideo, .file, .music, .voiceOrInstantVideo, .gif]
++
++    private static func hboltIsMedia(_ message: Message) -> Bool {
++        return hboltMediaTags.contains(where: { message.tags.contains($0) })
++    }
++
++    /// Strict topic match: in a forum both sides must carry the same thread id (nil == nil only for
++    /// non-forum chats). Messages of other topics are never included.
++    private static func hboltSameThread(_ message: Message, _ threadId: Int64?) -> Bool {
++        return message.threadId == threadId
++    }
++
++    /// Media messages (no plain text) from `start` up to the newest stored one, strictly inside the
++    /// start message's topic, oldest -> newest.
+     static func messageIdsFromHereToLatest(account: Account, from start: MessageId) -> Signal<[MessageId], NoError> {
+         return account.postbox.transaction { transaction -> [MessageId] in
+-            // HBOLT 0048: stay inside the start message's topic (forum chats mixed every topic before,
+-            // so the selection contained messages the topic view can't show), and raise the cap.
+             let threadId = transaction.getMessage(start)?.threadId
+             var ids: [MessageId] = []
+             transaction.scanTopMessages(peerId: start.peerId, namespace: start.namespace, limit: 20000, { message in
+                 if message.id.id >= start.id {
+-                    if threadId == nil || message.threadId == threadId {
++                    if hboltSameThread(message, threadId) && hboltIsMedia(message) {
+                         ids.append(message.id)
+                     }
+                     return true
+@@ -22,24 +34,26 @@ public extension HBOLTSettings {
+                 return false
+             })
+             ids.reverse()
+-            if !ids.contains(start) {
+-                ids.append(start)
+-            }
+             return ids
+         }
+     }
+ 
+-    /// Shared-media version: same media kind (photos/videos, files, links, music, voice, GIFs)
+-    /// from `message` up to the newest locally stored one, max 5000.
++    /// Shared-media version: same media kind from `message` up to the newest stored one, strictly
++    /// inside the message's topic.
+     static func mediaIdsFromHereToLatest(account: Account, message: Message) -> Signal<[MessageId], NoError> {
+         let start = message.id
+         let startIndex = message.index
+-        let preferred: [MessageTags] = [.photoOrVideo, .file, .webPage, .music, .voiceOrInstantVideo, .gif]
+-        guard let tag = preferred.first(where: { message.tags.contains($0) }) else {
++        let threadId = message.threadId
++        guard let tag = hboltMediaTags.first(where: { message.tags.contains($0) }) ?? (message.tags.contains(.webPage) ? .webPage : nil) else {
+             return messageIdsFromHereToLatest(account: account, from: start)
+         }
+         return account.postbox.transaction { transaction -> [MessageId] in
+-            var ids = transaction.hboltLaterIndicesWithTag(peerId: start.peerId, namespace: start.namespace, tag: tag, from: startIndex, limit: 5000).map { $0.id }
++            var ids: [MessageId] = []
++            for index in transaction.hboltLaterIndicesWithTag(peerId: start.peerId, namespace: start.namespace, tag: tag, from: startIndex, limit: 20000) {
++                if let m = transaction.getMessage(index.id), hboltSameThread(m, threadId) {
++                    ids.append(index.id)
++                }
++            }
+             if !ids.contains(start) {
+                 ids.insert(start, at: 0)
+             }
+@@ -47,17 +61,19 @@ public extension HBOLTSettings {
+         }
+     }
+ 
+-    /// Every media message (photos, videos, documents, music, voice/round, GIFs) in the chat,
+-    /// newest first, max 5000. Plain text messages are ignored.
+-    static func allMediaIds(account: Account, peerId: PeerId) -> Signal<[MessageId], NoError> {
++    /// Every media message (no plain text) in the chat, restricted to `threadId` when given (forum
++    /// topic), newest first, max 5000.
++    static func allMediaIds(account: Account, peerId: PeerId, threadId: Int64? = nil) -> Signal<[MessageId], NoError> {
+         return account.postbox.transaction { transaction -> [MessageId] in
+-            let tags: [MessageTags] = [.photoOrVideo, .file, .music, .voiceOrInstantVideo, .gif]
+             var indices = Set<MessageIndex>()
+-            for tag in tags {
++            for tag in hboltMediaTags {
+                 let found = transaction.hboltLaterIndicesWithTag(peerId: peerId, namespace: Namespaces.Message.Cloud, tag: tag, from: MessageIndex.lowerBound(peerId: peerId, namespace: Namespaces.Message.Cloud), limit: 100000)
+                 indices.formUnion(found)
+             }
+-            let sorted = indices.sorted(by: { $0 > $1 })
++            var sorted = indices.sorted(by: { $0 > $1 })
++            if let threadId = threadId {
++                sorted = sorted.filter { transaction.getMessage($0.id)?.threadId == threadId }
++            }
+             return Array(sorted.prefix(5000)).map { $0.id }
+         }
+     }
+diff --git a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+index 3c4c9b8..4c2785d 100644
+--- a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
++++ b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+@@ -2235,7 +2235,7 @@ func contextMenuForChatPresentationInterfaceState(chatPresentationInterfaceState
+                     return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/SelectAll"), color: theme.actionSheet.primaryTextColor)
+                 }, action: { _, f in
+                     f(.default)
+-                    let _ = (HBOLTSettings.allMediaIds(account: context.account, peerId: message.id.peerId)
++                    let _ = (HBOLTSettings.allMediaIds(account: context.account, peerId: message.id.peerId, threadId: message.threadId)
+                     |> deliverOnMainQueue).startStandalone(next: { ids in
+                         interfaceInteraction.beginMessageSelection(ids, { _ in })
+                     })
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreen.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreen.swift
+index 7f7afa0..c890ea0 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreen.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreen.swift
+@@ -882,7 +882,7 @@ final class PeerInfoScreenNode: ViewControllerTracingNode, PeerInfoScreenNodePro
+                                 guard let strongSelf = self else {
+                                     return
+                                 }
+-                                let _ = (HBOLTSettings.allMediaIds(account: strongSelf.context.account, peerId: message.id.peerId)
++                                let _ = (HBOLTSettings.allMediaIds(account: strongSelf.context.account, peerId: message.id.peerId, threadId: message.threadId)
+                                 |> deliverOnMainQueue).startStandalone(next: { ids in
+                                     guard let strongSelf = self else {
+                                         return
+@@ -1040,7 +1040,7 @@ final class PeerInfoScreenNode: ViewControllerTracingNode, PeerInfoScreenNodePro
+                                 guard let strongSelf = self else {
+                                     return
+                                 }
+-                                let _ = (HBOLTSettings.allMediaIds(account: strongSelf.context.account, peerId: message.id.peerId)
++                                let _ = (HBOLTSettings.allMediaIds(account: strongSelf.context.account, peerId: message.id.peerId, threadId: message.threadId)
+                                 |> deliverOnMainQueue).startStandalone(next: { ids in
+                                     guard let strongSelf = self else {
+                                         return
