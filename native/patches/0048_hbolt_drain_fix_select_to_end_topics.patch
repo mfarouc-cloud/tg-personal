@@ -1,0 +1,49 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index 1991c6a..1b95054 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -166,10 +166,13 @@ private func hboltBulkPrecacheAll(account: Account, messages: [Message], concurr
+ private func hboltDrainMediaSearch(account: Account, location: SearchMessagesLocation, state: SearchMessagesState?, accumulated: [Message]) -> Signal<[Message], NoError> {
+     return TelegramEngine(account: account).messages.searchMessages(location: location, query: "", state: state, limit: 100)
+     |> mapToSignal { result, updatedState -> Signal<[Message], NoError> in
+-        var all = accumulated
+-        all.append(contentsOf: result.messages)
+-        if result.completed || result.messages.isEmpty {
+-            return .single(all)
++        // HBOLT 0048: result.messages is the CUMULATIVE set merged so far (mergedState), not the new
++        // page. Appending it every page grew quadratically (~150 pages for 15k items) and could get
++        // the app killed for memory mid-run. Keep the latest cumulative set; stop when a page adds
++        // nothing new so a stalled cursor can never loop forever.
++        let all = result.messages
++        if result.completed || all.isEmpty || all.count <= accumulated.count {
++            return .single(all.count >= accumulated.count ? all : accumulated)
+         } else {
+             return hboltDrainMediaSearch(account: account, location: location, state: updatedState, accumulated: all)
+         }
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift b/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift
+index dfc989a..2023e72 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkSelect.swift
+@@ -8,14 +8,20 @@ public extension HBOLTSettings {
+     /// Ids of every locally stored message in the chat from `start` up to the newest one (max 5000).
+     static func messageIdsFromHereToLatest(account: Account, from start: MessageId) -> Signal<[MessageId], NoError> {
+         return account.postbox.transaction { transaction -> [MessageId] in
++            // HBOLT 0048: stay inside the start message's topic (forum chats mixed every topic before,
++            // so the selection contained messages the topic view can't show), and raise the cap.
++            let threadId = transaction.getMessage(start)?.threadId
+             var ids: [MessageId] = []
+-            transaction.scanTopMessages(peerId: start.peerId, namespace: start.namespace, limit: 5000, { message in
++            transaction.scanTopMessages(peerId: start.peerId, namespace: start.namespace, limit: 20000, { message in
+                 if message.id.id >= start.id {
+-                    ids.append(message.id)
++                    if threadId == nil || message.threadId == threadId {
++                        ids.append(message.id)
++                    }
+                     return true
+                 }
+                 return false
+             })
++            ids.reverse()
+             if !ids.contains(start) {
+                 ids.append(start)
+             }
