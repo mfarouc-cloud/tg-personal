@@ -1,0 +1,28 @@
+diff --git a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift
+index 6e1e699..3bccb54 100644
+--- a/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
++++ b/submodules/SettingsUI/Sources/Privacy and Security/PrivacyAndSecurityController.swift	
+@@ -468,6 +468,15 @@ private enum PrivacyAndSecurityEntry: ItemListNodeEntry {
+                     case 8: HBOLTSettings.setValue("hbolt.ghost.typing", value)
+                     case 9: HBOLTSettings.setValue("hbolt.ghost.reads", value)
+                     case 10: HBOLTSettings.setValue("hbolt.ghost.stories", value)
++                    // HBOLT 0050: Privacy Mode — one switch that turns on every protection scoped to
++                    // the user's OWN presence (online, typing, read receipts, story views). Touches
++                    // nothing about other people's messages or content.
++                    case 20:
++                        HBOLTSettings.ghostMode = value
++                        HBOLTSettings.setValue("hbolt.ghost.online", value)
++                        HBOLTSettings.setValue("hbolt.ghost.typing", value)
++                        HBOLTSettings.setValue("hbolt.ghost.reads", value)
++                        HBOLTSettings.setValue("hbolt.ghost.stories", value)
+                     case 1: HBOLTSettings.keepDeleted = value
+                     case 2: HBOLTSettings.bypassProtection = value
+                     case 3: HBOLTSettings.hideSponsored = value
+@@ -867,6 +876,7 @@ private func privacyAndSecurityControllerEntries(
+     entries.append(.dataSettingsInfo(presentationData.theme, presentationData.strings.PrivacySettings_DataSettingsHelp))
+     
+     entries.append(.openLinksIn(presentationData.theme, presentationData.strings.ChatSettings_OpenLinksIn, defaultWebBrowser))
++    entries.append(.hboltSwitch(20, "🛡 Privacy Mode (hide all my presence)", HBOLTSettings.ghostMode && HBOLTSettings.value("hbolt.ghost.online") && HBOLTSettings.value("hbolt.ghost.typing") && HBOLTSettings.value("hbolt.ghost.reads") && HBOLTSettings.value("hbolt.ghost.stories")))
+     entries.append(.hboltGhostMode("👻 Ghost Mode (HBOLT)", HBOLTSettings.ghostMode))
+     entries.append(.hboltSwitch(7, "   ↳ Hide online status", HBOLTSettings.value("hbolt.ghost.online")))
+     entries.append(.hboltSwitch(8, "   ↳ Hide typing…", HBOLTSettings.value("hbolt.ghost.typing")))
