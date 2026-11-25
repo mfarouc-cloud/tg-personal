@@ -1,0 +1,455 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index e9e543e..1a22cfc 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -739,3 +739,388 @@ private func hboltReferenceSendRun(account: Account, messages: [Message], toPeer
+     }
+     return chain |> then(completion)
+ }
++
++// MARK: - HBOLT 0053: Clean Save to Saved Messages (bulk, photo/video only).
++//
++// Saves every photo/video of a chat (or topic) into the account's Saved Messages, cleanly (no
++// "Forwarded from", no view-once / self-destruct timer). Design goals, per the HBOLT spec:
++//  • photoVideo ONLY — documents, audio, links, text are never captured.
++//  • Telegram-to-Telegram first: an unprotected item is re-sent by reference (inputMediaPhoto /
++//    inputMediaDocument by id), so even a 50-minute 4K video is copied server-side with nothing
++//    downloaded or re-uploaded. Only items the server refuses (protected chats, view-once) fall back
++//    to download + clean re-upload.
++//  • A durable queue: the full captured id set is written to disk the moment the run starts, so a
++//    20 000-item batch is not lost if the user is kicked, leaves, or the app is killed mid-run.
++//  • A scoped "bypass session" that stays active across EVERY 10-item album chunk until the whole
++//    batch reaches Done, immune to kicks / cancellation / transient drops / server rejections, then
++//    tears itself down automatically and leaves zero lingering state.
++//  • Honest accounting: an item counts as "Verified in Saved" only when it is actually accepted and
++//    present in Saved Messages; a server-refused item counts as "Rejected by Server" and never as
++//    saved. Final counts are reported in Saved Messages when the batch completes.
++
++public enum HBOLTCleanSave {
++    /// Start a bulk Clean Save of all photos/videos in `fromPeerId` (optionally one topic) into the
++    /// account's Saved Messages. Detached from the caller: leaving the screen or cancelling does not
++    /// stop it — it runs to Done. Safe to call again; a run already in progress for this account is
++    /// not duplicated.
++    public static func start(account: Account, fromPeerId: PeerId, fromThreadId: Int64?) {
++        hboltCleanSaveStartRun(account: account, fromPeerId: fromPeerId, fromThreadId: fromThreadId)
++    }
++
++    /// Resume any durable Clean Save batch left unfinished by a previous launch (kick / kill mid-run).
++    /// Call once per account at startup.
++    public static func resumeIfNeeded(account: Account) {
++        hboltCleanSaveResume(account: account)
++    }
++}
++
++// Persisted batch state (durable queue). pending holds the remaining source message ids (Cloud
++// namespace) in the source peer; counters accumulate across chunks and across relaunches.
++private struct HBOLTCleanSaveState: Codable {
++    let accountId: Int64
++    let sourcePeerId: Int64
++    let threadId: Int64?
++    var pending: [Int32]
++    var verified: Int
++    var rejected: Int
++    let total: Int
++}
++
++private enum HBOLTCleanSaveStore {
++    private static let lock = NSLock()
++
++    private static func url(accountId: Int64) -> URL? {
++        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
++            return nil
++        }
++        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
++        return base.appendingPathComponent("hbolt-cleansave-\(accountId).json")
++    }
++
++    static func save(_ state: HBOLTCleanSaveState) {
++        lock.lock(); defer { lock.unlock() }
++        guard let url = url(accountId: state.accountId), let data = try? JSONEncoder().encode(state) else {
++            return
++        }
++        try? data.write(to: url, options: .atomic)
++    }
++
++    static func load(accountId: Int64) -> HBOLTCleanSaveState? {
++        lock.lock(); defer { lock.unlock() }
++        guard let url = url(accountId: accountId), let data = try? Data(contentsOf: url) else {
++            return nil
++        }
++        return try? JSONDecoder().decode(HBOLTCleanSaveState.self, from: data)
++    }
++
++    static func clear(accountId: Int64) {
++        lock.lock(); defer { lock.unlock() }
++        if let url = url(accountId: accountId) {
++            try? FileManager.default.removeItem(at: url)
++        }
++    }
++}
++
++// The scoped bypass session: owns the durable state and the background keep-alive for exactly one
++// batch. One run per account at a time (a second trigger while one is live is ignored).
++private final class HBOLTCleanSaveSession {
++    let account: Account
++    var state: HBOLTCleanSaveState
++
++    init(account: Account, state: HBOLTCleanSaveState) {
++        self.account = account
++        self.state = state
++    }
++
++    func persist() {
++        HBOLTCleanSaveStore.save(self.state)
++    }
++
++    // Automatic normal-state restoration: clear the durable queue so nothing lingers.
++    func teardown() {
++        HBOLTCleanSaveStore.clear(accountId: self.state.accountId)
++    }
++}
++
++private let hboltCleanSaveLock = NSLock()
++private var hboltCleanSaveActiveAccounts = Set<Int64>()
++private let hboltCleanSaveRuns = DisposableSet()
++
++private func hboltCleanSaveTryClaim(_ accountId: Int64) -> Bool {
++    hboltCleanSaveLock.lock(); defer { hboltCleanSaveLock.unlock() }
++    if hboltCleanSaveActiveAccounts.contains(accountId) {
++        return false
++    }
++    hboltCleanSaveActiveAccounts.insert(accountId)
++    return true
++}
++
++private func hboltCleanSaveRelease(_ accountId: Int64) {
++    hboltCleanSaveLock.lock(); defer { hboltCleanSaveLock.unlock() }
++    hboltCleanSaveActiveAccounts.remove(accountId)
++}
++
++// photoVideo-only drain: server media search for .photo and .video, deduped and chronological;
++// falls back to the locally-synced tag index when the server returns nothing (e.g. after a kick).
++private func hboltCleanSaveDrain(account: Account, fromPeerId: PeerId, fromThreadId: Int64?) -> Signal<[Message], NoError> {
++    let videoLocation: SearchMessagesLocation = .peer(peerId: fromPeerId, fromId: nil, tags: .video, reactions: nil, threadId: fromThreadId, minDate: nil, maxDate: nil)
++    let photoLocation: SearchMessagesLocation = .peer(peerId: fromPeerId, fromId: nil, tags: .photo, reactions: nil, threadId: fromThreadId, minDate: nil, maxDate: nil)
++    return combineLatest(
++        hboltDrainMediaSearch(account: account, location: videoLocation, state: nil, accumulated: []),
++        hboltDrainMediaSearch(account: account, location: photoLocation, state: nil, accumulated: [])
++    )
++    |> mapToSignal { videoMessages, photoMessages -> Signal<[Message], NoError> in
++        let server = hboltSonicFilteredSorted(videoMessages + photoMessages, fromThreadId: fromThreadId)
++        if !server.isEmpty {
++            return .single(server)
++        }
++        return hboltLocalMediaMessages(account: account, peerId: fromPeerId, threadId: fromThreadId, tags: [.video, .photo])
++        |> map { local -> [Message] in
++            return hboltSonicFilteredSorted(local, fromThreadId: fromThreadId)
++        }
++    }
++}
++
++private func hboltCleanSaveStartRun(account: Account, fromPeerId: PeerId, fromThreadId: Int64?) {
++    let accountId = account.peerId.toInt64()
++    if !hboltCleanSaveTryClaim(accountId) {
++        return
++    }
++    // Background coverage is provided by the global "any message unsent" keep-alive (HBOLT 0052):
++    // each enqueued chunk keeps the app scheduled until it is delivered.
++    let work: Signal<Never, NoError> = hboltCleanSaveDrain(account: account, fromPeerId: fromPeerId, fromThreadId: fromThreadId)
++    |> mapToSignal { messages -> Signal<Never, NoError> in
++        // Oldest -> newest so Saved Messages keeps the original order; capture ids once, durably.
++        let ids = messages.sorted(by: { $0.index < $1.index }).map { $0.id.id }
++        if ids.isEmpty {
++            return hboltReportToSaved(account: account, targetPeerId: nil, text: "🫧 Clean Save: no photos or videos found here.")
++        }
++        let state = HBOLTCleanSaveState(accountId: accountId, sourcePeerId: fromPeerId.toInt64(), threadId: fromThreadId, pending: ids, verified: 0, rejected: 0, total: ids.count)
++        HBOLTCleanSaveStore.save(state)
++        let session = HBOLTCleanSaveSession(account: account, state: state)
++        return hboltReportToSaved(account: account, targetPeerId: nil, text: "🫧 Clean Save started: \(ids.count) item(s) queued. You can leave this chat — saving continues in the background.")
++        |> then(hboltCleanSaveProcess(session: session))
++    }
++    hboltCleanSaveRuns.add((work
++    |> afterDisposed {
++        hboltCleanSaveRelease(accountId)
++    }).start())
++}
++
++private func hboltCleanSaveResume(account: Account) {
++    let accountId = account.peerId.toInt64()
++    guard let state = HBOLTCleanSaveStore.load(accountId: accountId), !state.pending.isEmpty else {
++        HBOLTCleanSaveStore.clear(accountId: accountId)
++        return
++    }
++    if !hboltCleanSaveTryClaim(accountId) {
++        return
++    }
++    let session = HBOLTCleanSaveSession(account: account, state: state)
++    let work = hboltReportToSaved(account: account, targetPeerId: nil, text: "🫧 Clean Save resumed: \(state.pending.count) of \(state.total) item(s) left.")
++    |> then(hboltCleanSaveProcess(session: session))
++    hboltCleanSaveRuns.add((work
++    |> afterDisposed {
++        hboltCleanSaveRelease(accountId)
++    }).start())
++}
++
++// The resilient queue loop: one 10-item album chunk at a time, with bounded backoff. Immune to
++// interruptions — a kick/leave/drop/rejection never aborts the loop; it keeps advancing until the
++// durable queue is empty, then reports and tears down.
++private func hboltCleanSaveProcess(session: HBOLTCleanSaveSession) -> Signal<Never, NoError> {
++    let account = session.account
++
++    func loop(backoff: Double) -> Signal<Never, NoError> {
++        if session.state.pending.isEmpty {
++            let s = session.state
++            session.teardown()
++            let text = "🫧 Clean Save done.\n✅ Verified in Saved: \(s.verified)\n⛔️ Rejected by Server: \(s.rejected)\n📦 Total captured: \(s.total)"
++            return hboltReportToSaved(account: account, targetPeerId: nil, text: text)
++        }
++        let take = min(10, session.state.pending.count)
++        let chunkIds = Array(session.state.pending.prefix(take))
++        let sourcePeerId = PeerId(session.state.sourcePeerId)
++        return hboltCleanSaveChunk(account: account, sourcePeerId: sourcePeerId, ids: chunkIds)
++        |> mapToSignal { result -> Signal<Never, NoError> in
++            // Advance the durable queue atomically: drop the processed chunk, fold in its outcome.
++            session.state.pending.removeFirst(take)
++            session.state.verified += result.verified
++            session.state.rejected += result.rejected
++            session.persist()
++            // Bounded pacing: ease off when the server is rejecting/flooding, speed up when it is calm.
++            let nextBackoff = result.serverRejected ? min(backoff * 1.7 + 0.6, 20.0) : max(0.25, backoff * 0.5)
++            let wait: Signal<Never, NoError> = (Signal<Void, NoError>.single(Void()) |> delay(nextBackoff, queue: hboltBulkWorkQueue)) |> ignoreValues
++            return wait |> then(loop(backoff: nextBackoff))
++        }
++    }
++
++    return loop(backoff: 0.25)
++}
++
++// Clean a source message's attributes for a permanent, provenance-free copy in Saved Messages.
++private func hboltCleanSaveAttributes(_ attributes: [MessageAttribute]) -> [MessageAttribute] {
++    return attributes.filter { attr in
++        !(attr is AutoremoveTimeoutMessageAttribute)
++            && !(attr is AutoclearTimeoutMessageAttribute)
++            && !(attr is ConsumableContentMessageAttribute)
++            && !(attr is SourceReferenceMessageAttribute)
++            && !(attr is ForwardCountMessageAttribute)
++            && !(attr is ForwardSourceInfoAttribute)
++            && !(attr is EditedMessageAttribute)
++            && !(attr is ReplyMessageAttribute)
++            && !(attr is ReplyMarkupMessageAttribute)
++            && !(attr is ViewCountMessageAttribute)
++    }
++}
++
++// An item must go straight to download + re-upload (reference send can't produce a clean permanent
++// copy): its source chat restricts saving, or it is view-once / self-destructing.
++private func hboltCleanSaveNeedsReupload(_ message: Message) -> Bool {
++    if HBOLTSettings.isProtected(message.id.peerId.toInt64()) {
++        return true
++    }
++    for attribute in message.attributes {
++        if attribute is AutoremoveTimeoutMessageAttribute || attribute is AutoclearTimeoutMessageAttribute {
++            return true
++        }
++    }
++    return false
++}
++
++// Process one <=10-item chunk. Returns how many ended up actually present in Saved Messages
++// (verified) vs refused by the server (rejected), and whether the server rejected anything on the
++// fast reference path (drives backoff).
++private func hboltCleanSaveChunk(account: Account, sourcePeerId: PeerId, ids: [Int32]) -> Signal<(verified: Int, rejected: Int, serverRejected: Bool), NoError> {
++    return account.postbox.transaction { transaction -> [Message] in
++        var messages: [Message] = []
++        for id in ids {
++            if let message = transaction.getMessage(MessageId(peerId: sourcePeerId, namespace: Namespaces.Message.Cloud, id: id)) {
++                messages.append(message)
++            }
++        }
++        return messages
++    }
++    |> mapToSignal { messages -> Signal<(verified: Int, rejected: Int, serverRejected: Bool), NoError> in
++        let valid = messages.filter { message in
++            message.media.contains(where: { $0 is TelegramMediaImage || (($0 as? TelegramMediaFile)?.isVideo ?? false) })
++        }
++        if valid.isEmpty {
++            // Nothing selectable in this chunk (deleted, or no longer photo/video): count as rejected
++            // so the totals still add up to the captured count.
++            return .single((verified: 0, rejected: ids.count, serverRejected: false))
++        }
++        let missing = ids.count - valid.count
++        var referenceable: [Message] = []
++        var reuploadDirect: [Message] = []
++        for message in valid {
++            if hboltCleanSaveNeedsReupload(message) {
++                reuploadDirect.append(message)
++            } else {
++                referenceable.append(message)
++            }
++        }
++        return hboltCleanSaveReferencePass(account: account, messages: referenceable)
++        |> mapToSignal { referenceFailed -> Signal<(verified: Int, rejected: Int, serverRejected: Bool), NoError> in
++            let serverRejected = !referenceFailed.isEmpty
++            let referenceVerified = referenceable.count - referenceFailed.count
++            let reuploadSet = reuploadDirect + referenceFailed
++            if reuploadSet.isEmpty {
++                return .single((verified: referenceVerified, rejected: missing, serverRejected: serverRejected))
++            }
++            return hboltCleanSaveReuploadPass(account: account, messages: reuploadSet)
++            |> map { stillFailed -> (verified: Int, rejected: Int, serverRejected: Bool) in
++                let reuploadVerified = reuploadSet.count - stillFailed
++                return (verified: referenceVerified + reuploadVerified, rejected: missing + stillFailed, serverRejected: serverRejected || stillFailed > 0)
++            }
++        }
++    }
++}
++
++// Fast path: re-send the items by reference into Saved Messages as one clean album (up to 10),
++// await delivery, delete + return any the server refused so the caller can re-upload them.
++private func hboltCleanSaveReferencePass(account: Account, messages: [Message]) -> Signal<[Message], NoError> {
++    if messages.isEmpty {
++        return .single([])
++    }
++    let groupId: Int64? = messages.count >= 2 ? Int64.random(in: Int64.min ... Int64.max) : nil
++    var batch: [EnqueueMessage] = []
++    var sources: [Message] = []
++    for message in messages {
++        guard let media = message.media.first(where: { $0 is TelegramMediaImage || $0 is TelegramMediaFile }) else {
++            continue
++        }
++        batch.append(.message(text: message.text, attributes: hboltCleanSaveAttributes(message.attributes), inlineStickers: [:], mediaReference: .message(message: MessageReference(message), media: media), threadId: nil, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: groupId, correlationId: nil, bubbleUpEmojiOrStickersets: []))
++        sources.append(message)
++    }
++    if batch.isEmpty {
++        return .single([])
++    }
++    return enqueueMessages(account: account, peerId: account.peerId, messages: batch)
++    |> mapToSignal { ids -> Signal<[Message], NoError> in
++        let newIds = ids.compactMap { $0 }
++        return hboltAwaitSent(account: account, ids: newIds)
++        |> map { _ in [Message]() }
++        |> then(account.postbox.transaction { transaction -> [Message] in
++            var failed: [Message] = []
++            for (index, id) in ids.enumerated() {
++                guard let id = id, index < sources.count else {
++                    continue
++                }
++                if let message = transaction.getMessage(id), message.flags.contains(.Failed) {
++                    failed.append(sources[index])
++                    // Remove the failed Saved-Messages bubble so it is never mistaken for a saved item.
++                    _internal_deleteMessages(transaction: transaction, mediaBox: account.postbox.mediaBox, ids: [id])
++                }
++            }
++            return failed
++        })
++    }
++}
++
++// Fallback: download each item (cache-first, progress-aware), detach to fresh local bytes, and
++// re-upload as a clean permanent album into Saved Messages. Returns how many still failed.
++private func hboltCleanSaveReuploadPass(account: Account, messages: [Message]) -> Signal<Int, NoError> {
++    if messages.isEmpty {
++        return .single(0)
++    }
++    let readies = messages.map { hboltBulkPrecache(account: account, message: $0) }
++    return combineLatest(readies)
++    |> take(1)
++    |> deliverOn(hboltBulkWorkQueue)
++    |> mapToSignal { _ -> Signal<Int, NoError> in
++        var detached: [Media] = []
++        var sources: [Message] = []
++        for message in messages {
++            if let media = hboltBulkDetachCached(account: account, message: message) {
++                detached.append(media)
++                sources.append(message)
++            }
++        }
++        let notCached = messages.count - detached.count
++        if detached.isEmpty {
++            return .single(messages.count)
++        }
++        let groupId: Int64? = detached.count >= 2 ? Int64.random(in: Int64.min ... Int64.max) : nil
++        var batch: [EnqueueMessage] = []
++        for (index, media) in detached.enumerated() {
++            batch.append(.message(text: sources[index].text, attributes: hboltCleanSaveAttributes(sources[index].attributes), inlineStickers: [:], mediaReference: .standalone(media: media), threadId: nil, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: groupId, correlationId: nil, bubbleUpEmojiOrStickersets: []))
++        }
++        return enqueueMessages(account: account, peerId: account.peerId, messages: batch)
++        |> mapToSignal { ids -> Signal<Int, NoError> in
++            let newIds = ids.compactMap { $0 }
++            return hboltAwaitSent(account: account, ids: newIds)
++            |> map { _ in 0 }
++            |> then(account.postbox.transaction { transaction -> Int in
++                var failed = 0
++                for id in newIds {
++                    if let message = transaction.getMessage(id), message.flags.contains(.Failed) {
++                        failed += 1
++                        _internal_deleteMessages(transaction: transaction, mediaBox: account.postbox.mediaBox, ids: [id])
++                    }
++                }
++                return failed + notCached
++            })
++        }
++    }
++}
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayMediaGalleryContextMenu.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayMediaGalleryContextMenu.swift
+index ede1007..bcd9700 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayMediaGalleryContextMenu.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayMediaGalleryContextMenu.swift
+@@ -346,6 +346,12 @@ extension PeerInfoScreenNode {
+                     a(.default)
+                     self?.hboltSonicBulkStart()
+                 })))
++                items.append(.action(ContextMenuActionItem(text: "🫧 Clean Save All → Saved Messages", icon: { theme in
++                    return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Download"), color: theme.contextMenu.primaryColor)
++                }, action: { [weak self] _, a in
++                    a(.default)
++                    self?.hboltCleanSaveAllStart()
++                })))
+ 
+                 var ignoreNextActions = false
+                 // The pane, not the screen, decides: a profile opened from a channel's direct
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
+index 86a64c3..52f1b75 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
+@@ -404,6 +404,16 @@ extension PeerInfoScreenNode {
+         self.controller?.push(peerSelectionController)
+     }
+ 
++    // HBOLT 0053: Clean Save — 1-tap. Saves ALL photos/videos of this chat/topic into the account's
++    // own Saved Messages, cleanly (no "forwarded from", no view-once). No target picker: the target is
++    // always Saved Messages. Runs detached in the background and survives leaving the chat / a kick.
++    func hboltCleanSaveAllStart() {
++        guard self.peerId.namespace != Namespaces.Peer.SecretChat else {
++            return
++        }
++        HBOLTCleanSave.start(account: self.context.account, fromPeerId: self.peerId, fromThreadId: self.chatLocation.threadId)
++    }
++
+     // HBOLT: Sonic Bulk — 1-tap, no Albums/Singles dialog, straight to the target picker. Forwards
+     // ALL media (photos + videos) via the isolated producer-consumer fast-lane pipeline.
+     func hboltSonicBulkStart() {
+diff --git a/submodules/TelegramUI/Sources/AppDelegate.swift b/submodules/TelegramUI/Sources/AppDelegate.swift
+index 6e87eed..be152ef 100644
+--- a/submodules/TelegramUI/Sources/AppDelegate.swift
++++ b/submodules/TelegramUI/Sources/AppDelegate.swift
+@@ -1228,6 +1228,19 @@ private func extractAccountManagerState(records: AccountRecordsView<TelegramAcco
+                 }
+             })
+ 
++            // HBOLT 0053: resume any durable Clean Save batch left unfinished by a previous launch
++            // (kick / app kill mid-run). Idempotent per account; a live run is never duplicated.
++            var hboltCleanSaveResumed = Set<Int64>()
++            let _ = (sharedContext.activeAccountContexts
++            |> deliverOnMainQueue).start(next: { _, accounts, _ in
++                for entry in accounts {
++                    let id = entry.1.account.peerId.toInt64()
++                    if hboltCleanSaveResumed.insert(id).inserted {
++                        HBOLTCleanSave.resumeIfNeeded(account: entry.1.account)
++                    }
++                }
++            })
++
+             let notificationManager = SharedNotificationManager(episodeId: self.episodeId, application: application, clearNotificationsManager: clearNotificationsManager, inForeground: applicationBindings.applicationInForeground, accounts: sharedContext.activeAccountContexts |> map { primary, accounts, _ in accounts.map({ ($0.1.account, $0.1.account.id == primary?.account.id) }) }, pollLiveLocationOnce: { accountId in
+                 let _ = (self.context.get()
+                 |> filter {

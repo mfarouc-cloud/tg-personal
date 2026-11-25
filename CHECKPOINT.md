@@ -3,6 +3,21 @@
 Personal Telegram client: TypeScript + Vite + teleproto (MTProto over WebSocket),
 wrapped as an iOS app with Capacitor 8 (SPM). Repo: `mfarouc-cloud/tg-personal`.
 
+## Native patch 0053 — Clean Save to Saved Messages (bulk)
+One-tap "🫧 Clean Save All → Saved Messages" in a chat's Shared Media menu. Saves every photo/video of the chat/topic into the account's own Saved Messages, cleanly (no "forwarded from", no view-once/TTL).
+
+| Requirement | Implementation | Files |
+|---|---|---|
+| photoVideo only | Server drain of `.photo` + `.video` tags (InputMessagesFilterPhotoVideo), deduped; docs/audio/links/text never captured | `HBOLTBulkForward.swift` (`hboltCleanSaveDrain`) |
+| Telegram-to-Telegram, no download | Unprotected items re-sent **by reference** (inputMediaPhoto/Document by id) into Saved Messages as clean 10-item albums — a 50-min 4K video copies server-side | `hboltCleanSaveReferencePass` |
+| Scoped bypass, continuous through all chunks, immune to kicks/cancel/drops/rejections | Run is **detached** (not tied to the UI disposable) in `hboltCleanSaveRuns`; one run per account (`tryClaim`); loop advances every chunk until the durable queue is empty, then tears down | `hboltCleanSaveStartRun`, `hboltCleanSaveProcess` |
+| Server rejection handling + bounded backoff | Reference-rejected (protected/view-once) items fall back to download + clean re-upload; per-chunk backoff 0.25s→20s, never an infinite spin | `hboltCleanSaveChunk`, `hboltCleanSaveReuploadPass` |
+| Auto restore to normal after Done | On empty queue: clear durable file, report, release claim; zero lingering flags | `HBOLTCleanSaveSession.teardown` |
+| Durable queue (20k+ survive kick/kill) | Full captured id list + counters persisted to `hbolt-cleansave-<accountId>.json` on start and after every chunk; resumed at launch | `HBOLTCleanSaveStore`, `HBOLTCleanSave.resumeIfNeeded` (AppDelegate) |
+| No phantom saved items | Item counts **Verified in Saved** only if present + not `.Failed` after send; server-refused counts **Rejected by Server**; failed Saved bubbles deleted; final counts reported | `hboltCleanSaveChunk`, reference/reupload passes |
+
+Background coverage reuses the 0052 global "any message unsent → keep alive" observer (TelegramCore can't reference the UI keep-alive without a module cycle). Verified here: all 54 patches apply on the pinned commit. Swift compiled on the macOS CI runner.
+
 ## Native patch 0052 — user requests after the audit
 | Area | Change | Files |
 |---|---|---|
