@@ -1,8 +1,29 @@
 diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
-index e9e543e..1a22cfc 100644
+index e9e543e..70a3f1e 100644
 --- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
 +++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
-@@ -739,3 +739,388 @@ private func hboltReferenceSendRun(account: Account, messages: [Message], toPeer
+@@ -73,6 +73,20 @@ private func hboltAwaitSent(account: Account, ids: [MessageId]) -> Signal<Never,
+     |> ignoreValues
+ }
+ 
++// HBOLT 0053: like hboltAwaitSent but emits one Void when the ids have left the unsent queue, so a
++// following mapToSignal (which runs on an emitted value) can inspect the results. Avoids mapping over
++// a Never signal, which the build rejects as "will never be executed".
++private func hboltAwaitSentVoid(account: Account, ids: [MessageId]) -> Signal<Void, NoError> {
++    let pending = Set(ids)
++    if pending.isEmpty {
++        return .single(Void())
++    }
++    return account.postbox.unsentMessageIdsView()
++    |> filter { view in view.ids.isDisjoint(with: pending) }
++    |> take(1)
++    |> map { _ in Void() }
++}
++
+ private func hboltBulkResource(_ media: Media) -> (MediaResource, MediaResourceUserContentType)? {
+     if let image = media as? TelegramMediaImage, let largest = largestImageRepresentation(image.representations) {
+         return (largest.resource, .image)
+@@ -739,3 +753,390 @@ private func hboltReferenceSendRun(account: Account, messages: [Message], toPeer
      }
      return chain |> then(completion)
  }
@@ -326,22 +347,23 @@ index e9e543e..1a22cfc 100644
 +    return enqueueMessages(account: account, peerId: account.peerId, messages: batch)
 +    |> mapToSignal { ids -> Signal<[Message], NoError> in
 +        let newIds = ids.compactMap { $0 }
-+        return hboltAwaitSent(account: account, ids: newIds)
-+        |> map { _ in [Message]() }
-+        |> then(account.postbox.transaction { transaction -> [Message] in
-+            var failed: [Message] = []
-+            for (index, id) in ids.enumerated() {
-+                guard let id = id, index < sources.count else {
-+                    continue
++        return hboltAwaitSentVoid(account: account, ids: newIds)
++        |> mapToSignal { _ -> Signal<[Message], NoError> in
++            return account.postbox.transaction { transaction -> [Message] in
++                var failed: [Message] = []
++                for (index, id) in ids.enumerated() {
++                    guard let id = id, index < sources.count else {
++                        continue
++                    }
++                    if let message = transaction.getMessage(id), message.flags.contains(.Failed) {
++                        failed.append(sources[index])
++                        // Remove the failed Saved-Messages bubble so it is never mistaken for a saved item.
++                        _internal_deleteMessages(transaction: transaction, mediaBox: account.postbox.mediaBox, ids: [id])
++                    }
 +                }
-+                if let message = transaction.getMessage(id), message.flags.contains(.Failed) {
-+                    failed.append(sources[index])
-+                    // Remove the failed Saved-Messages bubble so it is never mistaken for a saved item.
-+                    _internal_deleteMessages(transaction: transaction, mediaBox: account.postbox.mediaBox, ids: [id])
-+                }
++                return failed
 +            }
-+            return failed
-+        })
++        }
 +    }
 +}
 +
@@ -376,18 +398,19 @@ index e9e543e..1a22cfc 100644
 +        return enqueueMessages(account: account, peerId: account.peerId, messages: batch)
 +        |> mapToSignal { ids -> Signal<Int, NoError> in
 +            let newIds = ids.compactMap { $0 }
-+            return hboltAwaitSent(account: account, ids: newIds)
-+            |> map { _ in 0 }
-+            |> then(account.postbox.transaction { transaction -> Int in
-+                var failed = 0
-+                for id in newIds {
-+                    if let message = transaction.getMessage(id), message.flags.contains(.Failed) {
-+                        failed += 1
-+                        _internal_deleteMessages(transaction: transaction, mediaBox: account.postbox.mediaBox, ids: [id])
++            return hboltAwaitSentVoid(account: account, ids: newIds)
++            |> mapToSignal { _ -> Signal<Int, NoError> in
++                return account.postbox.transaction { transaction -> Int in
++                    var failed = 0
++                    for id in newIds {
++                        if let message = transaction.getMessage(id), message.flags.contains(.Failed) {
++                            failed += 1
++                            _internal_deleteMessages(transaction: transaction, mediaBox: account.postbox.mediaBox, ids: [id])
++                        }
 +                    }
++                    return failed + notCached
 +                }
-+                return failed + notCached
-+            })
++            }
 +        }
 +    }
 +}
