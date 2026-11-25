@@ -3,6 +3,9 @@
 Personal Telegram client: TypeScript + Vite + teleproto (MTProto over WebSocket),
 wrapped as an iOS app with Capacitor 8 (SPM). Repo: `mfarouc-cloud/tg-personal`.
 
+## Native patch 0054 — Clean Save keeps albums, isolates bad items
+A 10-item album is atomic server-side: one bad/stale item (e.g. an expired file reference) fails the whole album. On a large unprotected channel this rejected most of the batch (observed 623/1050). Fix: on an atomic album failure, **binary-split** the group and retry each half — clean halves go through as smaller albums (8 / 5 / 3 / 2…), the half holding the bad item keeps splitting until that item is alone and routed to re-upload (else counted Rejected). Albums are preserved for every good item; only the actual bad item is isolated. Applies to both the reference fast-path and the re-upload fallback. `HBOLTBulkForward.swift` (`hboltCleanSaveAlbumRecover`).
+
 ## Native patch 0053 — Clean Save to Saved Messages (bulk)
 One-tap "🫧 Clean Save All → Saved Messages" in a chat's Shared Media menu. Saves every photo/video of the chat/topic into the account's own Saved Messages, cleanly (no "forwarded from", no view-once/TTL).
 
