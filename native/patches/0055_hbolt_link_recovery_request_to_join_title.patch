@@ -1,0 +1,123 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTSettings.swift b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+index 6891c21..e51fc77 100644
+--- a/submodules/TelegramCore/Sources/HBOLTSettings.swift
++++ b/submodules/TelegramCore/Sources/HBOLTSettings.swift
+@@ -221,6 +221,47 @@ public enum HBOLTSettings {
+         return loadInviteEntriesLocked().last(where: { $0.hash == hash }).flatMap { Int64($0.peerId) }
+     }
+ 
++    // HBOLT 0055: remember the TITLE an invite hash showed while it was valid. A request-to-join link
++    // never reveals its peerId before you are approved, so rememberInvite (peerId) can't fire for it;
++    // the title is the only identifier available at tap time. Later, an expired link can be matched
++    // to a known chat of exactly that title — even one you were since removed from.
++    private static let inviteTitleCacheKey = "hbolt.inviteTitleCache.v1"
++
++    public static func rememberInviteTitle(hash: String, title: String) {
++        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
++        guard !hash.isEmpty, !hash.contains("\t"), !trimmed.isEmpty, !trimmed.contains("\t") else {
++            return
++        }
++        inviteLock.lock()
++        defer { inviteLock.unlock() }
++        var entries: [(hash: String, title: String)] = (defaults.array(forKey: inviteTitleCacheKey) as? [String] ?? []).compactMap { entry in
++            let parts = entry.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
++            guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else {
++                return nil
++            }
++            return (String(parts[0]), String(parts[1]))
++        }
++        entries.removeAll(where: { $0.hash == hash })
++        entries.append((hash, trimmed))
++        if entries.count > inviteCacheLimit {
++            entries.removeFirst(entries.count - inviteCacheLimit)
++        }
++        defaults.set(entries.map { "\($0.hash)\t\($0.title)" }, forKey: inviteTitleCacheKey)
++    }
++
++    public static func rememberedInviteTitle(hash: String) -> String? {
++        inviteLock.lock()
++        defer { inviteLock.unlock() }
++        let entries = (defaults.array(forKey: inviteTitleCacheKey) as? [String] ?? [])
++        for entry in entries.reversed() {
++            let parts = entry.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
++            if parts.count == 2, parts[0] == hash, !parts[1].isEmpty {
++                return String(parts[1])
++            }
++        }
++        return nil
++    }
++
+     /// Ghost Mode: never appear online, never send "typing…", never send read receipts.
+     public static var ghostMode: Bool {
+         get { return defaults.bool(forKey: "hbolt.ghostMode") }
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift b/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
+index efde161..4cf0bdf 100644
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
+@@ -190,6 +190,9 @@ func _internal_joinLinkInformation(_ hash: String, account: Account) -> Signal<E
+                     let (apiFlags, title, about, invitePhoto, participantsCount, participants, nameColor, subscriptionPricing, subscriptionFormId, verification) = (chatInviteData.flags, chatInviteData.title, chatInviteData.about, chatInviteData.photo, chatInviteData.participantsCount, chatInviteData.participants, chatInviteData.color, chatInviteData.subscriptionPricing, chatInviteData.subscriptionFormId, chatInviteData.botVerification)
+                     let photo = telegramMediaImageFromApiPhoto(invitePhoto).flatMap({ smallestImageRepresentation($0.representations) })
+                     let flags: ExternalJoiningChatState.Invite.Flags = .init(isChannel: (apiFlags & (1 << 0)) != 0, isBroadcast: (apiFlags & (1 << 1)) != 0, isPublic: (apiFlags & (1 << 2)) != 0, isMegagroup: (apiFlags & (1 << 3)) != 0, requestNeeded: (apiFlags & (1 << 6)) != 0, isVerified: (apiFlags & (1 << 7)) != 0, isScam: (apiFlags & (1 << 8)) != 0, isFake: (apiFlags & (1 << 9)) != 0, canRefulfillSubscription: (apiFlags & (1 << 11)) != 0)
++                    // HBOLT 0055: a request-to-join link exposes no peerId until approval; remember its
++                    // title so an expired link can later be matched to a known chat of that title.
++                    HBOLTSettings.rememberInviteTitle(hash: hash, title: title)
+                     return .single(.invite(ExternalJoiningChatState.Invite(flags: flags, title: title, about: about, photoRepresentation: photo, participantsCount: participantsCount, participants: participants?.map({ EnginePeer(TelegramUser(user: $0)) }), nameColor: PeerNameColor(rawValue: nameColor), subscriptionPricing: subscriptionPricing.flatMap { StarsSubscriptionPricing(apiStarsSubscriptionPricing: $0) }, subscriptionFormId: subscriptionFormId, verification: verification.flatMap { PeerVerification(apiBotVerification: $0) })))
+                 case let .chatInviteAlready(chatInviteAlreadyData):
+                     let chat = chatInviteAlreadyData.chat
+@@ -318,7 +321,40 @@ func _internal_joinCallInvitationInformation(account: Account, messageId: Messag
+ /// HBOLT 0052: resolve an expired / revoked invite hash without the server's help. Searches every
+ /// chat on the account for messages containing the hash; a link preview of an invite carries the
+ /// target chat's title (and photo), which is then matched against chats the account knows.
++private func hboltExactPeerByTitle(transaction: Transaction, title: String) -> Peer? {
++    let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
++    if trimmed.isEmpty {
++        return nil
++    }
++    for rendered in transaction.searchPeers(query: trimmed, predicate: nil) {
++        guard let peer = rendered.peer, peer is TelegramChannel || peer is TelegramGroup else {
++            continue
++        }
++        if peer.debugDisplayTitle.compare(trimmed, options: .caseInsensitive) == .orderedSame {
++            return peer
++        }
++    }
++    return nil
++}
++
+ func hboltRecoverInvite(account: Account, hash: String) -> Signal<Peer?, NoError> {
++    // HBOLT 0055: a title remembered while the link was valid (incl. request-to-join) resolves to an
++    // exact known chat — even one you were removed from — before falling back to preview search.
++    if let title = HBOLTSettings.rememberedInviteTitle(hash: hash), !title.isEmpty {
++        return account.postbox.transaction { transaction -> Peer? in
++            return hboltExactPeerByTitle(transaction: transaction, title: title)
++        }
++        |> mapToSignal { peer -> Signal<Peer?, NoError> in
++            if let peer = peer {
++                return .single(peer)
++            }
++            return hboltRecoverInviteByPreview(account: account, hash: hash)
++        }
++    }
++    return hboltRecoverInviteByPreview(account: account, hash: hash)
++}
++
++private func hboltRecoverInviteByPreview(account: Account, hash: String) -> Signal<Peer?, NoError> {
+     let cleaned = hash.trimmingCharacters(in: CharacterSet(charactersIn: "+ /"))
+     if cleaned.count < 6 {
+         return .single(nil)
+@@ -344,13 +380,8 @@ func hboltRecoverInvite(account: Account, hash: String) -> Signal<Peer?, NoError
+         return account.postbox.transaction { transaction -> Peer? in
+             // Exact title match only, so a look-alike chat is never opened by mistake.
+             for title in previews {
+-                for rendered in transaction.searchPeers(query: title, predicate: nil) {
+-                    guard let peer = rendered.peer, peer is TelegramChannel || peer is TelegramGroup else {
+-                        continue
+-                    }
+-                    if peer.debugDisplayTitle.compare(title, options: .caseInsensitive) == .orderedSame {
+-                        return peer
+-                    }
++                if let peer = hboltExactPeerByTitle(transaction: transaction, title: title) {
++                    return peer
+                 }
+             }
+             return nil
