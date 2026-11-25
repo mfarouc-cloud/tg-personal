@@ -624,7 +624,7 @@ index 7f95066..1689229 100644
      }
  }
 diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift b/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
-index 5771807..989973c 100644
+index 5771807..efde161 100644
 --- a/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
 +++ b/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
 @@ -228,6 +228,20 @@ func _internal_joinLinkInformation(_ hash: String, account: Account) -> Signal<E
@@ -661,7 +661,7 @@ index 5771807..989973c 100644
 +    if cleaned.count < 6 {
 +        return .single(nil)
 +    }
-+    return _internal_searchMessages(account: account, location: .general(scope: .everywhere, groupId: nil, tags: nil, minDate: nil, maxDate: nil, folderId: nil, communityId: nil), query: cleaned, state: nil, limit: 100)
++    return _internal_searchMessages(account: account, location: .general(scope: .everywhere, groupId: nil, tags: nil, minDate: nil, maxDate: nil, folderId: nil, communityId: nil), query: cleaned, state: nil, centerId: nil, limit: 100)
 +    |> take(1)
 +    |> map { result, _ -> [String] in
 +        var titles: [String] = []
