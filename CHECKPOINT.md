@@ -3,6 +3,17 @@
 Personal Telegram client: TypeScript + Vite + teleproto (MTProto over WebSocket),
 wrapped as an iOS app with Capacitor 8 (SPM). Repo: `mfarouc-cloud/tg-personal`.
 
+## Native patch 0052 — user requests after the audit
+| Area | Change | Files |
+|---|---|---|
+| Expired link recovery | Unknown hash (never opened on this device): search the whole account for messages containing it; an invite link preview carries the target chat's title, matched **exactly** against chats the account knows, then opened and remembered | `JoinLink.swift` (`hboltRecoverInvite`) |
+| Select all / from here to latest | No cap. Local ids selected instantly, then the complete list is drained from the server (messages.search per media filter, 100/page until empty) and stored like any loaded message, and the selection is extended | `HBOLTBulkSelect.swift` (`allMediaIdsFromServer`, `*Complete`), `ChatInterfaceStateContextMenus.swift`, `PeerInfoScreen.swift` |
+| Member activity feed | Waits for the complete shared-group list (pages through all), searches 4 groups at a time, shows results progressively with "Searching X/Y", up to 300 rows | `HBOLTActivityFeed.swift` |
+| Account age | Real `registrationDate` from Telegram's peer settings when provided (+ phone country, name/photo change dates); otherwise an updated, clearly-labelled estimate | `PeerInfoProfileItems.swift` |
+| Albums-of-10 / View Once | Unprotected source → by reference (no download, works uncached). Protected + not on disk → downloaded first then sent as the album / view-once (was silently degraded to a plain forward) | `HBOLTProtectedForward.swift` |
+| Speed (protected path) | Hard links instead of byte copies; Sonic pipeline lets downloads run up to 2 chunks ahead of confirmed uploads; classic "Forward All" uses the same streaming pipeline; deferred units share one serial lane | `HBOLTBulkForward.swift`, `HBOLTProtectedForward.swift` |
+| Background | App kept alive while ANY message is unsent on any account (all modes, normal sends too); released when the queue is empty | `AppDelegate.swift`, `HBOLTBackgroundKeepAlive.swift` |
+
 ## Native patch 0051 — fixes from the feature audit
 | Problem | Fix | Files |
 |---|---|---|
