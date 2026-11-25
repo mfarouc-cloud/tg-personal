@@ -3,6 +3,18 @@
 Personal Telegram client: TypeScript + Vite + teleproto (MTProto over WebSocket),
 wrapped as an iOS app with Capacitor 8 (SPM). Repo: `mfarouc-cloud/tg-personal`.
 
+## Native patch 0051 — fixes from the feature audit
+| Problem | Fix | Files |
+|---|---|---|
+| Big videos silently dropped when forwarding from protected chats (hard 180 s download timeout, then the item was skipped with no notice) | Progress-aware wait: gives up only after 5 min with **no progress** while actively downloading, if the fetch fails, or after 3 h; queued downloads are never counted as stalled. Deferred items are sent one unit at a time in original order (no more dozens of parallel downloads starving each other), and any item that still fails is reported in **Saved Messages** | `HBOLTBulkForward.swift` (`hboltFetchUntilCached`), `HBOLTProtectedForward.swift` |
+| "Done. Sent…" report was posted into the **target chat** (visible to everyone in a group) | All HBOLT reports go to the user's own Saved Messages, with the target's name | `HBOLTBulkForward.swift` (`hboltReportToSaved`) |
+| Bulk forward re-downloaded + re-uploaded everything, even from normal (unprotected) chats | Unprotected sources are re-sent **by reference** (inputMediaPhoto/Document by id): no download, no upload, still albums of 10, no "Forwarded from". Items the server refuses (e.g. kicked from source) are removed and retried automatically via download + re-upload. Protected chats keep the re-upload path | `HBOLTBulkForward.swift` (`hboltReferenceSendRun`) |
+| "Select all media" silently selected only what is stored on the device (max 5000) | Selection still instant; then asks the server for the real count and, if larger, tells the user and points to Forward All / Sonic Bulk | `HBOLTBulkSelect.swift` (`serverMediaCount`, `partialSelectionWarning`), `ChatInterfaceStateContextMenus.swift`, `PeerInfoScreen.swift` |
+| Ghost Mode still sent read receipts in **secret chats** | `readEncryptedHistory` suppressed when "No read receipts" is on | `SynchronizePeerReadState.swift` |
+| Final count said items failed when they had been sent (a sent message gets a new cloud id, so the old lookup by local id missed it) | Count failures (still present + `Failed`) instead of successes | `HBOLTBulkForward.swift` (`hboltDeliveredCount`) |
+
+Verified here: all 52 patches apply cleanly on the pinned Telegram-iOS commit. Swift compile only happens on the macOS CI runner.
+
 ## Done in v1.2.0
 | Area | Change | Files |
 |---|---|---|
