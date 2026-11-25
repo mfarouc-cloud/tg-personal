@@ -17,7 +17,7 @@ export function openGallery(
   });
   let idx = Math.max(0, list.indexOf(msgs[start]));
   const stage = el("div", { class: "gstage" });
-  const counter = el("span", { class: "counter" });
+  const counter = el("span", { class: "counter", dir: "ltr" });
   let closed = false;
   const close = () => {
     if (closed) return;
@@ -51,8 +51,8 @@ export function openGallery(
     ...(opts.onForward ? [el("button", { class: "iconbtn", text: "↪", "aria-label": "توجيه", onclick: () => opts.onForward!(cur()) })] : []),
     ...(opts.onOpenInChat ? [el("button", { class: "iconbtn", text: "💬", "aria-label": "في المحادثة", onclick: () => (close(), opts.onOpenInChat!(cur())) })] : []),
   ]);
-  const prev = el("button", { class: "gnav prev", text: "›", "aria-label": "السابق", onclick: () => go(-1) });
-  const next = el("button", { class: "gnav next", text: "‹", "aria-label": "التالي", onclick: () => go(1) });
+  const prev = el("button", { class: "gnav prev", text: "‹", "aria-label": "السابق", onclick: () => go(-1) });
+  const next = el("button", { class: "gnav next", text: "›", "aria-label": "التالي", onclick: () => go(1) });
   const overlay = el("div", { class: "gviewer", role: "dialog" }, [bar, stage, prev, next]);
   // Keep every touch inside the viewer so nothing underneath reacts to swipes.
   for (const t of ["touchstart", "touchmove", "touchend", "click"]) overlay.addEventListener(t, (e) => e.stopPropagation());
