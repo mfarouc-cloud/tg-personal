@@ -1,5 +1,5 @@
 diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift b/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
-index 4cf0bdf..6576e32 100644
+index 4cf0bdf..6d59087 100644
 --- a/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
 +++ b/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
 @@ -121,7 +121,7 @@ public enum ExternalJoiningChatState {
@@ -56,7 +56,7 @@ index 4cf0bdf..6576e32 100644
      |> map(Optional.init)
      |> `catch` { error -> Signal<Api.ChatInvite?, JoinLinkInfoError> in
 -        if error.errorDescription.hasPrefix("FLOOD_WAIT") {
-+        let description = error.errorDescription
++        let description = error.errorDescription ?? ""
 +        if description.hasPrefix("FLOOD_WAIT") {
 +            let seconds = hboltParseFloodSeconds(description)
 +            if attempt < 3 && seconds <= 90 {
