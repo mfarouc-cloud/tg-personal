@@ -33,10 +33,10 @@ index 6bdd805..61dbf02 100644
  
 diff --git a/submodules/TelegramUI/Sources/Chat/HBOLTMediaPreview.swift b/submodules/TelegramUI/Sources/Chat/HBOLTMediaPreview.swift
 new file mode 100644
-index 0000000..c94fd39
+index 0000000..f745f83
 --- /dev/null
 +++ b/submodules/TelegramUI/Sources/Chat/HBOLTMediaPreview.swift
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,80 @@
 +import Foundation
 +import UIKit
 +import SwiftSignalKit
@@ -44,6 +44,8 @@ index 0000000..c94fd39
 +import Display
 +import AccountContext
 +import TelegramPresentationData
++import PresentationDataUtils
++import AlertUI
 +
 +extension ChatControllerImpl {
 +    // HBOLT 0056: true for a Telegram chat/invite link, so the "Media preview" action is offered only
