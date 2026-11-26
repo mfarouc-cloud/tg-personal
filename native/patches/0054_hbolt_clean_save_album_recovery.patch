@@ -1,8 +1,8 @@
 diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
-index 70a3f1e..5bc2821 100644
+index 70a3f1e..d0baa2c 100644
 --- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
 +++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
-@@ -1025,118 +1025,176 @@ private func hboltCleanSaveChunk(account: Account, sourcePeerId: PeerId, ids: [I
+@@ -1025,118 +1025,166 @@ private func hboltCleanSaveChunk(account: Account, sourcePeerId: PeerId, ids: [I
              return .single((verified: 0, rejected: ids.count, serverRejected: false))
          }
          let missing = ids.count - valid.count
@@ -78,10 +78,13 @@ index 70a3f1e..5bc2821 100644
 +        let groupId: Int64? = group.count >= 2 ? Int64.random(in: Int64.min ... Int64.max) : nil
 +        var batch: [EnqueueMessage] = []
 +        var ordered: [Message] = []
++        var unbuilt: [Message] = []
 +        for message in group {
 +            if let enqueue = build(message, groupId) {
 +                batch.append(enqueue)
 +                ordered.append(message)
++            } else {
++                unbuilt.append(message)
 +            }
          }
 -        batch.append(.message(text: message.text, attributes: hboltCleanSaveAttributes(message.attributes), inlineStickers: [:], mediaReference: .message(message: MessageReference(message), media: media), threadId: nil, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: groupId, correlationId: nil, bubbleUpEmojiOrStickersets: []))
@@ -130,10 +133,10 @@ index 70a3f1e..5bc2821 100644
 +            }
 +            |> mapToSignal { anyFailed -> Signal<[Message], NoError> in
 +                if !anyFailed {
-+                    return .single([])
++                    return .single(unbuilt)
 +                }
 +                if ordered.count <= 1 {
-+                    return .single(ordered)
++                    return .single(ordered + unbuilt)
 +                }
 +                let mid = ordered.count / 2
 +                let left = Array(ordered[0 ..< mid])
@@ -142,7 +145,7 @@ index 70a3f1e..5bc2821 100644
 +                |> mapToSignal { leftFailed -> Signal<[Message], NoError> in
 +                    return attempt(right)
 +                    |> map { rightFailed -> [Message] in
-+                        return leftFailed + rightFailed
++                        return leftFailed + rightFailed + unbuilt
                      }
                  }
 -                return failed
@@ -152,8 +155,11 @@ index 70a3f1e..5bc2821 100644
 +    return attempt(sources)
 +}
 +
-+// Fast path: re-send the items by reference into Saved Messages, grouped as albums; anything the
-+// server refuses even as a lone item is returned so the caller can re-upload it.
++// Fast path: NATIVE Telegram-to-Telegram forward into Saved Messages with drop-author (hideNames),
++// i.e. exactly what "Forward to Saved Messages (hide sender)" does — a server-side copy with no
++// download/upload, automatic file-reference revalidation, and original albums preserved (grouping
++// .auto). This is far more reliable than rebuilding messages by media id (stale file references).
++// Anything the server refuses even as a lone item (protected / view-once) is returned for re-upload.
 +private func hboltCleanSaveReferencePass(account: Account, messages: [Message]) -> Signal<[Message], NoError> {
 +    let withMedia = messages.filter { message in
 +        message.media.contains(where: { $0 is TelegramMediaImage || $0 is TelegramMediaFile })
@@ -161,11 +167,8 @@ index 70a3f1e..5bc2821 100644
 +    if withMedia.isEmpty {
 +        return .single([])
 +    }
-+    return hboltCleanSaveAlbumRecover(account: account, sources: withMedia, build: { message, groupId in
-+        guard let media = message.media.first(where: { $0 is TelegramMediaImage || $0 is TelegramMediaFile }) else {
-+            return nil
-+        }
-+        return .message(text: message.text, attributes: hboltCleanSaveAttributes(message.attributes), inlineStickers: [:], mediaReference: .message(message: MessageReference(message), media: media), threadId: nil, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: groupId, correlationId: nil, bubbleUpEmojiOrStickersets: [])
++    return hboltCleanSaveAlbumRecover(account: account, sources: withMedia, build: { message, _ in
++        return .forward(source: message.id, threadId: nil, grouping: .auto, attributes: [ForwardOptionsMessageAttribute(hideNames: true, hideCaptions: false)], correlationId: nil)
 +    })
  }
  
@@ -179,6 +182,7 @@ index 70a3f1e..5bc2821 100644
 -        return .single(0)
 +        return .single([])
      }
++    // Download (cache-first, progress-aware) everything first, then re-upload.
      let readies = messages.map { hboltBulkPrecache(account: account, message: $0) }
      return combineLatest(readies)
      |> take(1)
@@ -186,55 +190,20 @@ index 70a3f1e..5bc2821 100644
 -    |> mapToSignal { _ -> Signal<Int, NoError> in
 -        var detached: [Media] = []
 -        var sources: [Message] = []
-+    |> mapToSignal { _ -> Signal<[Message], NoError> in
-+        var detachedById: [MessageId: Media] = [:]
-+        var detachedSources: [Message] = []
-+        var notCached: [Message] = []
-         for message in messages {
-             if let media = hboltBulkDetachCached(account: account, message: message) {
+-        for message in messages {
+-            if let media = hboltBulkDetachCached(account: account, message: message) {
 -                detached.append(media)
 -                sources.append(message)
-+                detachedById[message.id] = media
-+                detachedSources.append(message)
-+            } else {
-+                notCached.append(message)
-             }
-         }
--        let notCached = messages.count - detached.count
--        if detached.isEmpty {
--            return .single(messages.count)
--        }
--        let groupId: Int64? = detached.count >= 2 ? Int64.random(in: Int64.min ... Int64.max) : nil
--        var batch: [EnqueueMessage] = []
--        for (index, media) in detached.enumerated() {
--            batch.append(.message(text: sources[index].text, attributes: hboltCleanSaveAttributes(sources[index].attributes), inlineStickers: [:], mediaReference: .standalone(media: media), threadId: nil, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: groupId, correlationId: nil, bubbleUpEmojiOrStickersets: []))
-+        if detachedSources.isEmpty {
-+            return .single(messages)
-         }
--        return enqueueMessages(account: account, peerId: account.peerId, messages: batch)
--        |> mapToSignal { ids -> Signal<Int, NoError> in
--            let newIds = ids.compactMap { $0 }
--            return hboltAwaitSentVoid(account: account, ids: newIds)
--            |> mapToSignal { _ -> Signal<Int, NoError> in
--                return account.postbox.transaction { transaction -> Int in
--                    var failed = 0
--                    for id in newIds {
--                        if let message = transaction.getMessage(id), message.flags.contains(.Failed) {
--                            failed += 1
--                            _internal_deleteMessages(transaction: transaction, mediaBox: account.postbox.mediaBox, ids: [id])
--                        }
--                    }
--                    return failed + notCached
--                }
-+        return hboltCleanSaveAlbumRecover(account: account, sources: detachedSources, build: { message, groupId in
-+            guard let media = detachedById[message.id] else {
++    |> mapToSignal { _ -> Signal<[Message], NoError> in
++        // Detach a FRESH local copy inside build on every (re)try, so a binary-split retry never
++        // reuses a temp file that a sibling send already consumed. An item with nothing on disk yet
++        // yields nil and is counted as failed by the album-recover (→ retried / rejected).
++        return hboltCleanSaveAlbumRecover(account: account, sources: messages, build: { message, groupId in
++            guard let media = hboltBulkDetachCached(account: account, message: message) else {
 +                return nil
              }
 +            return .message(text: message.text, attributes: hboltCleanSaveAttributes(message.attributes), inlineStickers: [:], mediaReference: .standalone(media: media), threadId: nil, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: groupId, correlationId: nil, bubbleUpEmojiOrStickersets: [])
 +        })
-+        |> map { stillFailed -> [Message] in
-+            return stillFailed + notCached
-+        }
 +    }
 +}
 +
@@ -252,7 +221,32 @@ index 70a3f1e..5bc2821 100644
 +            reuploadDirect.append(message)
 +        } else {
 +            referenceable.append(message)
-+        }
+         }
+-        let notCached = messages.count - detached.count
+-        if detached.isEmpty {
+-            return .single(messages.count)
+-        }
+-        let groupId: Int64? = detached.count >= 2 ? Int64.random(in: Int64.min ... Int64.max) : nil
+-        var batch: [EnqueueMessage] = []
+-        for (index, media) in detached.enumerated() {
+-            batch.append(.message(text: sources[index].text, attributes: hboltCleanSaveAttributes(sources[index].attributes), inlineStickers: [:], mediaReference: .standalone(media: media), threadId: nil, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: groupId, correlationId: nil, bubbleUpEmojiOrStickersets: []))
+-        }
+-        return enqueueMessages(account: account, peerId: account.peerId, messages: batch)
+-        |> mapToSignal { ids -> Signal<Int, NoError> in
+-            let newIds = ids.compactMap { $0 }
+-            return hboltAwaitSentVoid(account: account, ids: newIds)
+-            |> mapToSignal { _ -> Signal<Int, NoError> in
+-                return account.postbox.transaction { transaction -> Int in
+-                    var failed = 0
+-                    for id in newIds {
+-                        if let message = transaction.getMessage(id), message.flags.contains(.Failed) {
+-                            failed += 1
+-                            _internal_deleteMessages(transaction: transaction, mediaBox: account.postbox.mediaBox, ids: [id])
+-                        }
+-                    }
+-                    return failed + notCached
+-                }
+-            }
 +    }
 +    return hboltCleanSaveReferencePass(account: account, messages: referenceable)
 +    |> mapToSignal { referenceFailed -> Signal<[Message], NoError> in
