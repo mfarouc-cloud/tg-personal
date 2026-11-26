@@ -3,6 +3,9 @@
 Personal Telegram client: TypeScript + Vite + teleproto (MTProto over WebSocket),
 wrapped as an iOS app with Capacitor 8 (SPM). Repo: `mfarouc-cloud/tg-personal`.
 
+## Native patch 0059 — always albums of 10, zero loss (user priority over speed)
+User priority: media always regrouped into albums of 10, and nothing ever dropped — even at the cost of speed (download + re-upload). So: Clean Save now ALWAYS downloads + re-uploads (regroups into fresh albums of 10; a native forward would keep the source grouping) with its durable queue + per-chunk retry (4×) + resume-on-launch, so nothing is lost to a kick/restart/transient error. The album-recover now retries the WHOLE 10-item album a few times before isolating a bad item, so a transient upload error doesn't break an album into singles. Bulk forward (Sonic/Selected/Forward All) likewise always re-uploads into albums of 10 (the 0058 native-forward fast path is bypassed — it kept source grouping, not 10s). `HBOLTBulkForward.swift`. (Trade-off: this is slower than a server-side forward, and a restricted source must download+re-upload anyway — but it guarantees albums of 10 and no dropped items.)
+
 ## Native patch 0058 — bulk forward uses native forward (no download for open chats)
 The bulk-forward fast path (Sonic / Selected / Forward All) still rebuilt messages by media id, which failed on stale file references and fell back to the slow download + re-upload path for everything ("as if I downloaded and re-uploaded it myself"). Switch it to a NATIVE Telegram forward with drop-author (hideNames), like the 0054 Clean Save fix: a server-side copy, no download, in order, file references auto-revalidated, original album grouping preserved. Protected sources still require download + re-upload (server refuses to forward restricted content) — that is unavoidable. `HBOLTBulkForward.swift` (`hboltReferenceSendRun`).
 
