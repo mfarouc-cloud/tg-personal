@@ -3,6 +3,9 @@
 Personal Telegram client: TypeScript + Vite + teleproto (MTProto over WebSocket),
 wrapped as an iOS app with Capacitor 8 (SPM). Repo: `mfarouc-cloud/tg-personal`.
 
+## Native patch 0058 — bulk forward uses native forward (no download for open chats)
+The bulk-forward fast path (Sonic / Selected / Forward All) still rebuilt messages by media id, which failed on stale file references and fell back to the slow download + re-upload path for everything ("as if I downloaded and re-uploaded it myself"). Switch it to a NATIVE Telegram forward with drop-author (hideNames), like the 0054 Clean Save fix: a server-side copy, no download, in order, file references auto-revalidated, original album grouping preserved. Protected sources still require download + re-upload (server refuses to forward restricted content) — that is unavoidable. `HBOLTBulkForward.swift` (`hboltReferenceSendRun`).
+
 ## Native patch 0057 — no "too many attempts" when opening many invite links
 Opening many invite links quickly used to hit FLOOD_WAIT ("too many attempts") and interrupt work. Now invite checks (`checkChatInvite`) and joins (`importChatInvite`) auto-wait short floods via MTProto; a reported FLOOD_WAIT is waited out and retried (up to 3×, ≤90s) so the preview opens on its own just later; and successful checks are cached for 3 min so re-opening the same link doesn't re-hit the server. The server-side limit is not bypassed — requests are paced and waited for, never forced (forcing it risks the account). `JoinLink.swift`.
 

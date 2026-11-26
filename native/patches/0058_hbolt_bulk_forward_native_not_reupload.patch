@@ -1,0 +1,27 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index d0baa2c..caa486f 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -698,13 +698,18 @@ private func hboltReferenceSendRun(account: Account, messages: [Message], toPeer
+         if items.isEmpty {
+             continue
+         }
+-        let groupId: Int64? = (asAlbums && items.count >= 2) ? Int64.random(in: Int64.min ... Int64.max) : nil
+-        if groupId != nil {
++        // HBOLT 0058: NATIVE Telegram forward with drop-author (hideNames) instead of rebuilding the
++        // message by media id. Rebuilding failed on stale file references, which dropped the whole run
++        // onto the slow download + re-upload path ("as if I downloaded and re-uploaded it myself").
++        // A native forward is a server-side copy: no download, keeps order, auto-revalidates file
++        // references, and preserves the source's original album grouping. (grouping .auto, so asAlbums
++        // no longer regroups — regrouping into fixed 10s is impossible without downloading.)
++        if asAlbums {
+             task.albums += 1
+         }
+         let batch: [EnqueueMessage] = items.map { item -> EnqueueMessage in
+-            let (message, media) = item
+-            return .message(text: message.text, attributes: hboltStripProvenance(message.attributes), inlineStickers: [:], mediaReference: .message(message: MessageReference(message), media: media), threadId: toThreadId, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: groupId, correlationId: nil, bubbleUpEmojiOrStickersets: [])
++            let (message, _) = item
++            return .forward(source: message.id, threadId: toThreadId, grouping: .auto, attributes: [ForwardOptionsMessageAttribute(hideNames: true, hideCaptions: false)], correlationId: nil)
+         }
+         let sources = items.map { $0.0 }
+         let step: Signal<Never, NoError> = enqueueMessages(account: account, peerId: toPeerId, messages: batch)
