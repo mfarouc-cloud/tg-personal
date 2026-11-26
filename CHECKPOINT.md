@@ -3,6 +3,9 @@
 Personal Telegram client: TypeScript + Vite + teleproto (MTProto over WebSocket),
 wrapped as an iOS app with Capacitor 8 (SPM). Repo: `mfarouc-cloud/tg-personal`.
 
+## Native patch 0057 — no "too many attempts" when opening many invite links
+Opening many invite links quickly used to hit FLOOD_WAIT ("too many attempts") and interrupt work. Now invite checks (`checkChatInvite`) and joins (`importChatInvite`) auto-wait short floods via MTProto; a reported FLOOD_WAIT is waited out and retried (up to 3×, ≤90s) so the preview opens on its own just later; and successful checks are cached for 3 min so re-opening the same link doesn't re-hit the server. The server-side limit is not bypassed — requests are paced and waited for, never forced (forcing it risks the account). `JoinLink.swift`.
+
 ## Native patch 0056 — "Media preview" from a link long-press
 Long-pressing a Telegram chat/invite link now offers **🖼 Media preview** (both the action-sheet and context-menu variants). It resolves the link to a peer by every available means — public username, an invite you can peek or are already in, or a peer recovered from an expired / request-to-join link via the 0055 invite-title cache — and opens that peer's read-only profile (Media tab) WITHOUT joining. When the link is a private group you have no access to, it says so plainly (Telegram serves a non-member no media). Only shown for t.me / telegram.me chat links. `HBOLTMediaPreview.swift` (new), `ChatControllerOpenLinkContextMenu.swift`.
 

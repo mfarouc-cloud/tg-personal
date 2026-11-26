@@ -1,0 +1,93 @@
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift b/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
+index 4cf0bdf..6576e32 100644
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Peers/JoinLink.swift
+@@ -121,7 +121,7 @@ public enum ExternalJoiningChatState {
+ }
+ 
+ func _internal_joinChatInteractively(with hash: String, account: Account) -> Signal<InternalJoinLinkResult, JoinLinkError> {
+-    return account.network.request(Api.functions.messages.importChatInvite(hash: hash), automaticFloodWait: false)
++    return account.network.request(Api.functions.messages.importChatInvite(hash: hash), automaticFloodWait: true)
+     |> mapError { error -> JoinLinkError in
+         switch error.errorDescription {
+             case "CHANNELS_TOO_MUCH":
+@@ -172,17 +172,73 @@ func _internal_joinChatInteractively(with hash: String, account: Account) -> Sig
+     }
+ }
+ 
+-func _internal_joinLinkInformation(_ hash: String, account: Account) -> Signal<ExternalJoiningChatState, JoinLinkInfoError> {
+-    let accountPeerId = account.peerId
+-    return account.network.request(Api.functions.messages.checkChatInvite(hash: hash), automaticFloodWait: false)
++// HBOLT 0057: FLOOD_WAIT-resilient invite checking. Opening many invite links quickly used to hit
++// "too many attempts" and stop the user's work. Now: short floods are auto-waited by MTProto, a
++// bounded retry waits out a reported FLOOD_WAIT and tries again (so the preview still opens, just
++// later), and successful checks are cached briefly so re-opening the same link does not re-hit the
++// server at all. The server-side rate limit itself is NOT bypassed — requests are paced and waited
++// for, never forced.
++private let hboltInviteCheckLock = NSLock()
++private var hboltInviteCheckCache: [String: (invite: Api.ChatInvite, time: Double)] = [:]
++private let hboltInviteCheckTTL: Double = 180.0
++
++private func hboltCachedInvite(_ hash: String) -> Api.ChatInvite? {
++    hboltInviteCheckLock.lock()
++    defer { hboltInviteCheckLock.unlock() }
++    if let entry = hboltInviteCheckCache[hash], CFAbsoluteTimeGetCurrent() - entry.time < hboltInviteCheckTTL {
++        return entry.invite
++    }
++    return nil
++}
++
++private func hboltStoreInvite(_ hash: String, _ invite: Api.ChatInvite) {
++    hboltInviteCheckLock.lock()
++    defer { hboltInviteCheckLock.unlock() }
++    hboltInviteCheckCache[hash] = (invite, CFAbsoluteTimeGetCurrent())
++    if hboltInviteCheckCache.count > 500, let oldest = hboltInviteCheckCache.min(by: { $0.value.time < $1.value.time })?.key {
++        hboltInviteCheckCache.removeValue(forKey: oldest)
++    }
++}
++
++private func hboltParseFloodSeconds(_ description: String) -> Int {
++    let digits = description.drop(while: { !$0.isNumber })
++    return Int(digits) ?? 5
++}
++
++private func hboltCheckChatInvite(account: Account, hash: String, attempt: Int) -> Signal<Api.ChatInvite?, JoinLinkInfoError> {
++    return account.network.request(Api.functions.messages.checkChatInvite(hash: hash), automaticFloodWait: true)
+     |> map(Optional.init)
+     |> `catch` { error -> Signal<Api.ChatInvite?, JoinLinkInfoError> in
+-        if error.errorDescription.hasPrefix("FLOOD_WAIT") {
++        let description = error.errorDescription
++        if description.hasPrefix("FLOOD_WAIT") {
++            let seconds = hboltParseFloodSeconds(description)
++            if attempt < 3 && seconds <= 90 {
++                return (Signal<Void, JoinLinkInfoError>.single(Void()) |> delay(Double(seconds) + 1.0, queue: Queue.concurrentDefaultQueue()))
++                |> mapToSignal { _ -> Signal<Api.ChatInvite?, JoinLinkInfoError> in
++                    return hboltCheckChatInvite(account: account, hash: hash, attempt: attempt + 1)
++                }
++            }
+             return .fail(.flood)
+-        } else {
+-            return .single(nil)
++        }
++        return .single(nil)
++    }
++}
++
++func _internal_joinLinkInformation(_ hash: String, account: Account) -> Signal<ExternalJoiningChatState, JoinLinkInfoError> {
++    let accountPeerId = account.peerId
++    let request: Signal<Api.ChatInvite?, JoinLinkInfoError>
++    if let cached = hboltCachedInvite(hash) {
++        request = .single(cached)
++    } else {
++        request = hboltCheckChatInvite(account: account, hash: hash, attempt: 0)
++        |> mapToSignal { result -> Signal<Api.ChatInvite?, JoinLinkInfoError> in
++            if let result = result {
++                hboltStoreInvite(hash, result)
++            }
++            return .single(result)
+         }
+     }
++    return request
+     |> mapToSignal { result -> Signal<ExternalJoiningChatState, JoinLinkInfoError> in
+         if let result = result {
+             switch result {
