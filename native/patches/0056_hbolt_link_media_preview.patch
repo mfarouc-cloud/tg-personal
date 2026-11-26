@@ -1,0 +1,117 @@
+diff --git a/submodules/TelegramUI/Sources/Chat/ChatControllerOpenLinkContextMenu.swift b/submodules/TelegramUI/Sources/Chat/ChatControllerOpenLinkContextMenu.swift
+index 6bdd805..61dbf02 100644
+--- a/submodules/TelegramUI/Sources/Chat/ChatControllerOpenLinkContextMenu.swift
++++ b/submodules/TelegramUI/Sources/Chat/ChatControllerOpenLinkContextMenu.swift
+@@ -300,6 +300,12 @@ extension ChatControllerImpl {
+                         }
+                     }))
+                 }
++                if self.hboltIsTelegramChatLink(url) {
++                    items.append(ActionSheetButtonItem(title: "🖼 Media preview", color: .accent, action: { [weak self, weak actionSheet] in
++                        actionSheet?.dismissAnimated()
++                        self?.hboltOpenMediaPreview(url: url)
++                    }))
++                }
+                 actionSheet.setItemGroups([ActionSheetItemGroup(items: items), ActionSheetItemGroup(items: [
+                     ActionSheetButtonItem(title: self.presentationData.strings.Common_Cancel, color: .accent, font: .bold, action: { [weak actionSheet] in
+                         actionSheet?.dismissAnimated()
+@@ -408,6 +414,15 @@ extension ChatControllerImpl {
+                 )
+             }
+ 
++            if self.hboltIsTelegramChatLink(url) {
++                items.append(
++                    .action(ContextMenuActionItem(text: "🖼 Media preview", icon: { theme in return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/ImageEnlarge"), color: theme.contextMenu.primaryColor) }, action: { [weak self] _, f in
++                        f(.default)
++                        self?.hboltOpenMediaPreview(url: url)
++                    }))
++                )
++            }
++
+             return ContextController.Items(content: .list(items))
+         }
+ 
+diff --git a/submodules/TelegramUI/Sources/Chat/HBOLTMediaPreview.swift b/submodules/TelegramUI/Sources/Chat/HBOLTMediaPreview.swift
+new file mode 100644
+index 0000000..c94fd39
+--- /dev/null
++++ b/submodules/TelegramUI/Sources/Chat/HBOLTMediaPreview.swift
+@@ -0,0 +1,78 @@
++import Foundation
++import UIKit
++import SwiftSignalKit
++import TelegramCore
++import Display
++import AccountContext
++import TelegramPresentationData
++
++extension ChatControllerImpl {
++    // HBOLT 0056: true for a Telegram chat/invite link, so the "Media preview" action is offered only
++    // where it can apply (t.me / telegram.me usernames and +hash / joinchat invite links).
++    func hboltIsTelegramChatLink(_ url: String) -> Bool {
++        let lower = url.lowercased()
++        guard lower.contains("t.me/") || lower.contains("telegram.me/") || lower.contains("telegram.dog/") else {
++            return false
++        }
++        for bad in ["/share", "/socks", "/proxy", "/addstickers", "/addemoji", "/bg/", "/setlanguage", "/confirmphone", "/login"] {
++            if lower.contains(bad) {
++                return false
++            }
++        }
++        return true
++    }
++
++    // HBOLT 0056: open a chat's MEDIA without joining it. Resolves the link to a peer by every means
++    // available (public username, an invite you can peek / are already in, or a peer recovered from an
++    // expired / request-to-join link via the invite-title cache) and opens its read-only profile, where
++    // the Media tab lists its photos/videos. When the link points to a private chat you have no access
++    // to there is genuinely no media to show (Telegram serves a non-member nothing), so it says so.
++    func hboltOpenMediaPreview(url: String) {
++        let context = self.context
++        let presentationData = self.presentationData
++        let notAvailable: () -> Void = { [weak self] in
++            guard let self else {
++                return
++            }
++            self.present(textAlertController(context: context, updatedPresentationData: self.updatedPresentationData, title: "Media preview", text: "No media to preview here. This looks like a private group you're not a member of — Telegram doesn't share a non-member's media, and an expired or request-to-join link carries none.", actions: [TextAlertAction(type: .defaultAction, title: presentationData.strings.Common_OK, action: {})]), in: .window(.root))
++        }
++        let openPeer: (EnginePeer) -> Void = { [weak self] peer in
++            guard let self else {
++                return
++            }
++            guard let controller = context.sharedContext.makePeerInfoController(context: context, updatedPresentationData: self.updatedPresentationData, peer: peer, mode: .generic, avatarInitiallyExpanded: false, fromChat: false, requestsContext: nil) else {
++                return
++            }
++            self.push(controller)
++        }
++        let _ = (context.sharedContext.resolveUrl(context: context, peerId: nil, url: url, skipUrlAuth: true)
++        |> deliverOnMainQueue).startStandalone(next: { resolved in
++            switch resolved {
++            case let .peer(rawPeer, _):
++                if let rawPeer {
++                    openPeer(EnginePeer(rawPeer))
++                } else {
++                    notAvailable()
++                }
++            case let .channelMessage(peer, _, _):
++                openPeer(EnginePeer(peer))
++            case let .join(hash):
++                let _ = (context.engine.peers.joinLinkInformation(hash)
++                |> deliverOnMainQueue).startStandalone(next: { state in
++                    switch state {
++                    case let .alreadyJoined(peer):
++                        openPeer(peer)
++                    case let .peek(peer, _):
++                        openPeer(peer)
++                    case .invite, .invalidHash:
++                        notAvailable()
++                    }
++                }, error: { _ in
++                    notAvailable()
++                })
++            default:
++                notAvailable()
++            }
++        })
++    }
++}

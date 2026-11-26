@@ -3,6 +3,9 @@
 Personal Telegram client: TypeScript + Vite + teleproto (MTProto over WebSocket),
 wrapped as an iOS app with Capacitor 8 (SPM). Repo: `mfarouc-cloud/tg-personal`.
 
+## Native patch 0056 — "Media preview" from a link long-press
+Long-pressing a Telegram chat/invite link now offers **🖼 Media preview** (both the action-sheet and context-menu variants). It resolves the link to a peer by every available means — public username, an invite you can peek or are already in, or a peer recovered from an expired / request-to-join link via the 0055 invite-title cache — and opens that peer's read-only profile (Media tab) WITHOUT joining. When the link is a private group you have no access to, it says so plainly (Telegram serves a non-member no media). Only shown for t.me / telegram.me chat links. `HBOLTMediaPreview.swift` (new), `ChatControllerOpenLinkContextMenu.swift`.
+
 ## Native patch 0055 — Expired link recovery for request-to-join links
 A `t.me/+hash` request-to-join link never exposes its peerId until you are approved, so the hash→peer cache can't capture it. Now the invite **title** shown while the link is valid is remembered (`rememberInviteTitle`); when the link later expires, recovery matches that title to an exact known chat — even one you were removed from — before falling back to preview search. Does not recover a link whose title was never seen on this device while valid. `HBOLTSettings.swift`, `JoinLink.swift`.
 
