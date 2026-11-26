@@ -1,0 +1,124 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index 256f234..13a878b 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -899,21 +899,37 @@ private final class HBOLTCleanSaveSession {
+ }
+ 
+ private let hboltCleanSaveLock = NSLock()
+-private var hboltCleanSaveActiveAccounts = Set<Int64>()
++private var hboltCleanSaveActiveDisposables: [Int64: MetaDisposable] = [:]
+ private let hboltCleanSaveRuns = DisposableSet()
+ 
+-private func hboltCleanSaveTryClaim(_ accountId: Int64) -> Bool {
++// Register a fresh run, cancelling any run already in progress for this account (used by a manual
++// Clean Save so it always starts over, oldest -> newest). Returns the disposable to drive the run.
++private func hboltCleanSaveBeginFresh(_ accountId: Int64) -> MetaDisposable {
+     hboltCleanSaveLock.lock(); defer { hboltCleanSaveLock.unlock() }
+-    if hboltCleanSaveActiveAccounts.contains(accountId) {
+-        return false
++    if let existing = hboltCleanSaveActiveDisposables[accountId] {
++        existing.dispose()
+     }
+-    hboltCleanSaveActiveAccounts.insert(accountId)
+-    return true
++    let disposable = MetaDisposable()
++    hboltCleanSaveActiveDisposables[accountId] = disposable
++    hboltCleanSaveRuns.add(disposable)
++    return disposable
++}
++
++// Register a run only if none is active (used by launch-resume so it never interrupts a live run).
++private func hboltCleanSaveBeginIfIdle(_ accountId: Int64) -> MetaDisposable? {
++    hboltCleanSaveLock.lock(); defer { hboltCleanSaveLock.unlock() }
++    if hboltCleanSaveActiveDisposables[accountId] != nil {
++        return nil
++    }
++    let disposable = MetaDisposable()
++    hboltCleanSaveActiveDisposables[accountId] = disposable
++    hboltCleanSaveRuns.add(disposable)
++    return disposable
+ }
+ 
+ private func hboltCleanSaveRelease(_ accountId: Int64) {
+     hboltCleanSaveLock.lock(); defer { hboltCleanSaveLock.unlock() }
+-    hboltCleanSaveActiveAccounts.remove(accountId)
++    hboltCleanSaveActiveDisposables.removeValue(forKey: accountId)
+ }
+ 
+ // photoVideo-only drain: server media search for .photo and .video, deduped and chronological;
+@@ -939,9 +955,10 @@ private func hboltCleanSaveDrain(account: Account, fromPeerId: PeerId, fromThrea
+ 
+ private func hboltCleanSaveStartRun(account: Account, fromPeerId: PeerId, fromThreadId: Int64?) {
+     let accountId = account.peerId.toInt64()
+-    if !hboltCleanSaveTryClaim(accountId) {
+-        return
+-    }
++    // Always start fresh: cancel any run in progress and clear the old durable queue so a new Clean
++    // Save re-drains from the oldest item, never continuing a stale queue.
++    let disposable = hboltCleanSaveBeginFresh(accountId)
++    HBOLTCleanSaveStore.clear(accountId: accountId)
+     // Background coverage is provided by the global "any message unsent" keep-alive (HBOLT 0052):
+     // each enqueued chunk keeps the app scheduled until it is delivered.
+     let work: Signal<Never, NoError> = hboltCleanSaveDrain(account: account, fromPeerId: fromPeerId, fromThreadId: fromThreadId)
+@@ -957,7 +974,7 @@ private func hboltCleanSaveStartRun(account: Account, fromPeerId: PeerId, fromTh
+         return hboltReportToSaved(account: account, targetPeerId: nil, text: "🫧 Clean Save started: \(ids.count) item(s) queued. You can leave this chat — saving continues in the background.")
+         |> then(hboltCleanSaveProcess(session: session))
+     }
+-    hboltCleanSaveRuns.add((work
++    disposable.set((work
+     |> afterDisposed {
+         hboltCleanSaveRelease(accountId)
+     }).start())
+@@ -969,13 +986,13 @@ private func hboltCleanSaveResume(account: Account) {
+         HBOLTCleanSaveStore.clear(accountId: accountId)
+         return
+     }
+-    if !hboltCleanSaveTryClaim(accountId) {
++    guard let disposable = hboltCleanSaveBeginIfIdle(accountId) else {
+         return
+     }
+     let session = HBOLTCleanSaveSession(account: account, state: state)
+     let work = hboltReportToSaved(account: account, targetPeerId: nil, text: "🫧 Clean Save resumed: \(state.pending.count) of \(state.total) item(s) left.")
+     |> then(hboltCleanSaveProcess(session: session))
+-    hboltCleanSaveRuns.add((work
++    disposable.set((work
+     |> afterDisposed {
+         hboltCleanSaveRelease(accountId)
+     }).start())
+@@ -1048,15 +1065,28 @@ private func hboltCleanSaveNeedsReupload(_ message: Message) -> Bool {
+ // (verified) vs refused by the server (rejected), and whether the server rejected anything on the
+ // fast reference path (drives backoff).
+ private func hboltCleanSaveChunk(account: Account, sourcePeerId: PeerId, ids: [Int32]) -> Signal<(verified: Int, rejected: Int, serverRejected: Bool), NoError> {
+-    return account.postbox.transaction { transaction -> [Message] in
+-        var messages: [Message] = []
+-        for id in ids {
+-            if let message = transaction.getMessage(MessageId(peerId: sourcePeerId, namespace: Namespaces.Message.Cloud, id: id)) {
+-                messages.append(message)
+-            }
++    let messageIds = ids.map { MessageId(peerId: sourcePeerId, namespace: Namespaces.Message.Cloud, id: $0) }
++    // HBOLT 0059: re-fetch the chunk's messages FRESH from the cloud so their file references are
++    // valid. This makes the by-reference (no-download) album send reliable instead of failing on
++    // FILE_REFERENCE_EXPIRED, and stops messages evicted from the local DB being counted as "missing"
++    // rejections (the real cause of the huge reject counts). Falls back to local data if the fetch fails.
++    let localLoad: Signal<[Message], NoError> = account.postbox.transaction { transaction -> [Message] in
++        return messageIds.compactMap { transaction.getMessage($0) }
++    }
++    let fetched: Signal<[Message], NoError> = _internal_getMessagesLoadIfNecessary(messageIds, postbox: account.postbox, network: account.network, accountPeerId: account.peerId, strategy: .cloud(skipLocal: true))
++    |> mapToSignal { result -> Signal<[Message], GetMessagesError> in
++        if case let .result(messages) = result {
++            return .single(messages)
+         }
+-        return messages
++        return .complete()
++    }
++    |> take(1)
++    |> `catch` { _ -> Signal<[Message], NoError> in return .single([]) }
++    return fetched
++    |> mapToSignal { f -> Signal<[Message], NoError> in
++        return f.isEmpty ? localLoad : .single(f)
+     }
++    |> timeout(90.0, queue: hboltBulkWorkQueue, alternate: localLoad)
+     |> mapToSignal { messages -> Signal<(verified: Int, rejected: Int, serverRejected: Bool), NoError> in
+         let valid = messages.filter { message in
+             message.media.contains(where: { $0 is TelegramMediaImage || (($0 as? TelegramMediaFile)?.isVideo ?? false) })
