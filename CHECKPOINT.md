@@ -3,6 +3,9 @@
 Personal Telegram client: TypeScript + Vite + teleproto (MTProto over WebSocket),
 wrapped as an iOS app with Capacitor 8 (SPM). Repo: `mfarouc-cloud/tg-personal`.
 
+## Native patch 0061 — remove the online-gate regression + Clean Save to any chat
+The 0060 online-gate was a mistake: it waited for an exact `online` status, so it PAUSED in the background and got stuck for up to 15 min in the `updating` (syncing) state, needing an app restart to continue. Removed it — the run relies again on Telegram's own pending-message retry on reconnect (and the manual Resume button from 0060). Also: Clean Save now opens a **destination picker** — save to any chat you choose (pick yourself for Saved Messages), not only Saved Messages. `HBOLTBulkForward.swift` (state gains a target peer/thread; online-gate calls removed), `PeerInfoScreenMessageActions.swift` (picker).
+
 ## Native patch 0060 — auto-wait for connection + manual Resume
 A connection drop mid-run used to stall Clean Save (it never uploaded the rest). Now the run **waits for the connection to come back** before each chunk and before each retry (`account.network.connectionStatus` online gate), so it pauses on disconnect and continues automatically — nothing lost. Added a manual **🔄 Resume Clean Save** menu item (next to Clean Save All) that continues the saved durable queue from where it stopped (cancelling a stalled run first), for when the user wants to kick it by hand. `HBOLTBulkForward.swift` (`hboltWaitForOnline`, `resumeNow`), `PeerInfoScreenMessageActions.swift`, `PeerInfoScreenDisplayMediaGalleryContextMenu.swift`.
 
