@@ -3,6 +3,9 @@
 Personal Telegram client: TypeScript + Vite + teleproto (MTProto over WebSocket),
 wrapped as an iOS app with Capacitor 8 (SPM). Repo: `mfarouc-cloud/tg-personal`.
 
+## Native patch 0060 — auto-wait for connection + manual Resume
+A connection drop mid-run used to stall Clean Save (it never uploaded the rest). Now the run **waits for the connection to come back** before each chunk and before each retry (`account.network.connectionStatus` online gate), so it pauses on disconnect and continues automatically — nothing lost. Added a manual **🔄 Resume Clean Save** menu item (next to Clean Save All) that continues the saved durable queue from where it stopped (cancelling a stalled run first), for when the user wants to kick it by hand. `HBOLTBulkForward.swift` (`hboltWaitForOnline`, `resumeNow`), `PeerInfoScreenMessageActions.swift`, `PeerInfoScreenDisplayMediaGalleryContextMenu.swift`.
+
 ## Native patch 0059 — reliable fast albums (fresh refs) + fresh start + correct order
 Root cause of the huge reject counts (2314/2766 on an OPEN channel): the queued messages had STALE file references and many weren't in the local DB any more — so the by-reference (no-download) album send failed (FILE_REFERENCE_EXPIRED) and evicted messages were counted "missing/rejected" without even being tried. Fix: each chunk is **re-fetched fresh from the cloud** (`_internal_getMessagesLoadIfNecessary`, skipLocal) so file references are valid — the by-reference album send becomes reliable (fast, no download) for open channels, and nothing is falsely rejected. Also: a manual Clean Save now **always starts fresh** (cancels any run in progress, clears the old durable queue) so it re-drains oldest→newest instead of continuing a stale queue; launch-resume still covers a kick/kill mid-run. `HBOLTBulkForward.swift`.
 
