@@ -1,0 +1,65 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index ef5f609..9d7e94c 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -871,6 +871,9 @@ private struct HBOLTCleanSaveState: Codable {
+     // (zero loss over speed) before any are finally reported as rejected.
+     var retryPending: [Int32]
+     var passCount: Int
++    // HBOLT 0065: the failure count of the previous pass, to detect when retrying stops making
++    // progress (the only thing left is media deleted from the source).
++    var lastFailedCount: Int
+     var verified: Int
+     var rejected: Int
+     let total: Int
+@@ -1010,7 +1013,7 @@ private func hboltCleanSaveStartRun(account: Account, fromPeerId: PeerId, fromTh
+         if ids.isEmpty {
+             return hboltReportToSaved(account: account, targetPeerId: nil, text: "🫧 Clean Save: no photos or videos found here.")
+         }
+-        let state = HBOLTCleanSaveState(accountId: accountId, sourcePeerId: fromPeerId.toInt64(), threadId: fromThreadId, targetPeerId: toPeerId.toInt64(), targetThreadId: toThreadId, pending: ids, retryPending: [], passCount: 0, verified: 0, rejected: 0, total: ids.count)
++        let state = HBOLTCleanSaveState(accountId: accountId, sourcePeerId: fromPeerId.toInt64(), threadId: fromThreadId, targetPeerId: toPeerId.toInt64(), targetThreadId: toThreadId, pending: ids, retryPending: [], passCount: 0, lastFailedCount: -1, verified: 0, rejected: 0, total: ids.count)
+         HBOLTCleanSaveStore.save(state)
+         let session = HBOLTCleanSaveSession(account: account, state: state)
+         return hboltReportToSaved(account: account, targetPeerId: nil, text: "🫧 Clean Save started: \(ids.count) item(s) queued. You can leave this chat — saving continues in the background.")
+@@ -1070,25 +1073,33 @@ private func hboltCleanSaveProcess(session: HBOLTCleanSaveSession) -> Signal<Nev
+     // throughput while the per-chunk retry still guarantees nothing is dropped.
+     let parallelAlbums = 5
+ 
+-    let maxPasses = 4
++    // Safety ceiling so a pathological oscillation can't loop forever; progress normally stops it first.
++    let maxPasses = 100
+     func loop() -> Signal<Never, NoError> {
+         if session.state.pending.isEmpty {
+-            // A pass finished. Anything still failing gets another whole-queue pass (zero loss),
+-            // bounded so a genuinely-gone item (deleted on the server) can't loop forever.
++            // A pass finished. Re-queue EVERYTHING that didn't save and run another whole-queue pass —
++            // no cap on count — as long as each pass still saves at least one more item (makes
++            // progress). It stops only when a pass saves nothing new: the remainder is then media that
++            // no longer exists on the source (deleted), which can never be saved.
+             let stillFailed = Array(Set(session.state.retryPending))
+-            if !stillFailed.isEmpty && session.state.passCount < maxPasses {
++            let madeProgress = session.state.lastFailedCount < 0 || stillFailed.count < session.state.lastFailedCount
++            if !stillFailed.isEmpty && madeProgress && session.state.passCount < maxPasses {
++                session.state.lastFailedCount = stillFailed.count
+                 session.state.pending = stillFailed.sorted()
+                 session.state.retryPending = []
+                 session.state.passCount += 1
+                 session.persist()
+                 let pass = session.state.passCount
+-                return hboltReportToSaved(account: account, targetPeerId: nil, text: "🔁 Clean Save retry pass \(pass): \(stillFailed.count) item(s) that didn't go through yet.")
++                return hboltReportToSaved(account: account, targetPeerId: nil, text: "🔁 Clean Save retry pass \(pass): re-trying \(stillFailed.count) item(s) until every one still on the source is saved.")
+                 |> then(loop())
+             }
+-            let failed = stillFailed.count
+-            let verified = session.state.total - failed
++            let remaining = stillFailed.count
++            let verified = session.state.total - remaining
+             session.teardown()
+-            let text = "🫧 Clean Save done.\n✅ Verified in Saved: \(verified)\n⛔️ Could not save: \(failed)\n📦 Total captured: \(session.state.total)"
++            var text = "🫧 Clean Save done.\n✅ Saved: \(verified) of \(session.state.total)."
++            if remaining > 0 {
++                text += "\nℹ️ \(remaining) item(s) are no longer available on the source (deleted) — nothing was dropped on our side."
++            }
+             return hboltReportToSaved(account: account, targetPeerId: nil, text: text)
+         }
+         let windowSize = min(parallelAlbums * 10, session.state.pending.count)
