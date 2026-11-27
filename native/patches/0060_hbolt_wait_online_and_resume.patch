@@ -1,0 +1,134 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index 13a878b..9c472db 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -828,6 +828,33 @@ public enum HBOLTCleanSave {
+     public static func resumeIfNeeded(account: Account) {
+         hboltCleanSaveResume(account: account)
+     }
++
++    /// HBOLT 0060: manual "resume / refresh" — continue the saved durable queue from where it stopped
++    /// (e.g. a connection drop that stalled the run), cancelling any stalled run first. Does nothing
++    /// if there is no unfinished batch.
++    public static func resumeNow(account: Account) {
++        hboltCleanSaveResumeForced(account: account)
++    }
++
++    /// Whether an unfinished Clean Save batch exists for this account (so the UI can offer Resume).
++    public static func hasPendingBatch(account: Account) -> Bool {
++        return HBOLTCleanSaveStore.hasPending(accountId: account.peerId.toInt64())
++    }
++}
++
++private func hboltCleanSaveResumeForced(account: Account) {
++    let accountId = account.peerId.toInt64()
++    guard let state = HBOLTCleanSaveStore.load(accountId: accountId), !state.pending.isEmpty else {
++        return
++    }
++    let disposable = hboltCleanSaveBeginFresh(accountId)
++    let session = HBOLTCleanSaveSession(account: account, state: state)
++    let work = hboltReportToSaved(account: account, targetPeerId: nil, text: "🔄 Clean Save resumed: \(state.pending.count) of \(state.total) item(s) left.")
++    |> then(hboltCleanSaveProcess(session: session))
++    disposable.set((work
++    |> afterDisposed {
++        hboltCleanSaveRelease(accountId)
++    }).start())
+ }
+ 
+ // Persisted batch state (durable queue). pending holds the remaining source message ids (Cloud
+@@ -875,6 +902,14 @@ private enum HBOLTCleanSaveStore {
+             try? FileManager.default.removeItem(at: url)
+         }
+     }
++
++    static func hasPending(accountId: Int64) -> Bool {
++        lock.lock(); defer { lock.unlock() }
++        guard let url = url(accountId: accountId), let data = try? Data(contentsOf: url), let state = try? JSONDecoder().decode(HBOLTCleanSaveState.self, from: data) else {
++            return false
++        }
++        return !state.pending.isEmpty
++    }
+ }
+ 
+ // The scoped bypass session: owns the durable state and the background keep-alive for exactly one
+@@ -1001,6 +1036,22 @@ private func hboltCleanSaveResume(account: Account) {
+ // The resilient queue loop: one 10-item album chunk at a time, with bounded backoff. Immune to
+ // interruptions — a kick/leave/drop/rejection never aborts the loop; it keeps advancing until the
+ // durable queue is empty, then reports and tears down.
++// HBOLT 0060: completes once the account is connected (online). Used to pause the run while the
++// connection is down and continue automatically when it is back, instead of plowing on and marking
++// everything failed. A long timeout guards against a status that never reports online.
++private func hboltWaitForOnline(account: Account) -> Signal<Void, NoError> {
++    return account.network.connectionStatus
++    |> filter { status -> Bool in
++        if case .online = status {
++            return true
++        }
++        return false
++    }
++    |> take(1)
++    |> map { _ in Void() }
++    |> timeout(900.0, queue: hboltBulkWorkQueue, alternate: .single(Void()))
++}
++
+ private func hboltCleanSaveProcess(session: HBOLTCleanSaveSession) -> Signal<Never, NoError> {
+     let account = session.account
+ 
+@@ -1014,7 +1065,10 @@ private func hboltCleanSaveProcess(session: HBOLTCleanSaveSession) -> Signal<Nev
+         let take = min(10, session.state.pending.count)
+         let chunkIds = Array(session.state.pending.prefix(take))
+         let sourcePeerId = PeerId(session.state.sourcePeerId)
+-        return hboltCleanSaveChunk(account: account, sourcePeerId: sourcePeerId, ids: chunkIds)
++        return hboltWaitForOnline(account: account)
++        |> mapToSignal { _ -> Signal<(verified: Int, rejected: Int, serverRejected: Bool), NoError> in
++            return hboltCleanSaveChunk(account: account, sourcePeerId: sourcePeerId, ids: chunkIds)
++        }
+         |> mapToSignal { result -> Signal<Never, NoError> in
+             // Advance the durable queue atomically: drop the processed chunk, fold in its outcome.
+             session.state.pending.removeFirst(take)
+@@ -1102,7 +1156,10 @@ private func hboltCleanSaveChunk(account: Account, sourcePeerId: PeerId, ids: [I
+         // Each retry re-runs the full reference + re-upload path on only the remaining failures.
+         let maxRetries = 4
+         func withRetry(_ remaining: [Message], attempt: Int) -> Signal<[Message], NoError> {
+-            return hboltCleanSaveSendOnce(account: account, toPeerId: account.peerId, toThreadId: nil, messages: remaining)
++            return hboltWaitForOnline(account: account)
++            |> mapToSignal { _ -> Signal<[Message], NoError> in
++                return hboltCleanSaveSendOnce(account: account, toPeerId: account.peerId, toThreadId: nil, messages: remaining)
++            }
+             |> mapToSignal { failed -> Signal<[Message], NoError> in
+                 if failed.isEmpty || attempt >= maxRetries {
+                     return .single(failed)
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
+index 52f1b75..9f4eb62 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
+@@ -414,6 +414,12 @@ extension PeerInfoScreenNode {
+         HBOLTCleanSave.start(account: self.context.account, fromPeerId: self.peerId, fromThreadId: self.chatLocation.threadId)
+     }
+ 
++    // HBOLT 0060: manual Resume / Refresh — continue an unfinished Clean Save batch from where it
++    // stopped (e.g. after a connection drop), without re-starting from the beginning.
++    func hboltCleanSaveResumeTap() {
++        HBOLTCleanSave.resumeNow(account: self.context.account)
++    }
++
+     // HBOLT: Sonic Bulk — 1-tap, no Albums/Singles dialog, straight to the target picker. Forwards
+     // ALL media (photos + videos) via the isolated producer-consumer fast-lane pipeline.
+     func hboltSonicBulkStart() {
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayMediaGalleryContextMenu.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayMediaGalleryContextMenu.swift
+index bcd9700..7b7c46f 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayMediaGalleryContextMenu.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayMediaGalleryContextMenu.swift
+@@ -352,6 +352,12 @@ extension PeerInfoScreenNode {
+                     a(.default)
+                     self?.hboltCleanSaveAllStart()
+                 })))
++                items.append(.action(ContextMenuActionItem(text: "🔄 Resume Clean Save (if stopped)", icon: { theme in
++                    return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Resend"), color: theme.contextMenu.primaryColor)
++                }, action: { [weak self] _, a in
++                    a(.default)
++                    self?.hboltCleanSaveResumeTap()
++                })))
+ 
+                 var ignoreNextActions = false
+                 // The pane, not the screen, decides: a profile opened from a channel's direct

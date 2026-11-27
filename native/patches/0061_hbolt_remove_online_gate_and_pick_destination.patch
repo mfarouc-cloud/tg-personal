@@ -1,0 +1,115 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index 9c472db..4bddea9 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -819,8 +819,8 @@ public enum HBOLTCleanSave {
+     /// account's Saved Messages. Detached from the caller: leaving the screen or cancelling does not
+     /// stop it — it runs to Done. Safe to call again; a run already in progress for this account is
+     /// not duplicated.
+-    public static func start(account: Account, fromPeerId: PeerId, fromThreadId: Int64?) {
+-        hboltCleanSaveStartRun(account: account, fromPeerId: fromPeerId, fromThreadId: fromThreadId)
++    public static func start(account: Account, fromPeerId: PeerId, fromThreadId: Int64?, toPeerId: PeerId? = nil, toThreadId: Int64? = nil) {
++        hboltCleanSaveStartRun(account: account, fromPeerId: fromPeerId, fromThreadId: fromThreadId, toPeerId: toPeerId ?? account.peerId, toThreadId: toThreadId)
+     }
+ 
+     /// Resume any durable Clean Save batch left unfinished by a previous launch (kick / kill mid-run).
+@@ -863,6 +863,9 @@ private struct HBOLTCleanSaveState: Codable {
+     let accountId: Int64
+     let sourcePeerId: Int64
+     let threadId: Int64?
++    // HBOLT 0061: where the media is saved/forwarded to (defaults to the account's Saved Messages).
++    let targetPeerId: Int64
++    let targetThreadId: Int64?
+     var pending: [Int32]
+     var verified: Int
+     var rejected: Int
+@@ -988,7 +991,7 @@ private func hboltCleanSaveDrain(account: Account, fromPeerId: PeerId, fromThrea
+     }
+ }
+ 
+-private func hboltCleanSaveStartRun(account: Account, fromPeerId: PeerId, fromThreadId: Int64?) {
++private func hboltCleanSaveStartRun(account: Account, fromPeerId: PeerId, fromThreadId: Int64?, toPeerId: PeerId, toThreadId: Int64?) {
+     let accountId = account.peerId.toInt64()
+     // Always start fresh: cancel any run in progress and clear the old durable queue so a new Clean
+     // Save re-drains from the oldest item, never continuing a stale queue.
+@@ -1003,7 +1006,7 @@ private func hboltCleanSaveStartRun(account: Account, fromPeerId: PeerId, fromTh
+         if ids.isEmpty {
+             return hboltReportToSaved(account: account, targetPeerId: nil, text: "🫧 Clean Save: no photos or videos found here.")
+         }
+-        let state = HBOLTCleanSaveState(accountId: accountId, sourcePeerId: fromPeerId.toInt64(), threadId: fromThreadId, pending: ids, verified: 0, rejected: 0, total: ids.count)
++        let state = HBOLTCleanSaveState(accountId: accountId, sourcePeerId: fromPeerId.toInt64(), threadId: fromThreadId, targetPeerId: toPeerId.toInt64(), targetThreadId: toThreadId, pending: ids, verified: 0, rejected: 0, total: ids.count)
+         HBOLTCleanSaveStore.save(state)
+         let session = HBOLTCleanSaveSession(account: account, state: state)
+         return hboltReportToSaved(account: account, targetPeerId: nil, text: "🫧 Clean Save started: \(ids.count) item(s) queued. You can leave this chat — saving continues in the background.")
+@@ -1065,10 +1068,9 @@ private func hboltCleanSaveProcess(session: HBOLTCleanSaveSession) -> Signal<Nev
+         let take = min(10, session.state.pending.count)
+         let chunkIds = Array(session.state.pending.prefix(take))
+         let sourcePeerId = PeerId(session.state.sourcePeerId)
+-        return hboltWaitForOnline(account: account)
+-        |> mapToSignal { _ -> Signal<(verified: Int, rejected: Int, serverRejected: Bool), NoError> in
+-            return hboltCleanSaveChunk(account: account, sourcePeerId: sourcePeerId, ids: chunkIds)
+-        }
++        let targetPeerId = PeerId(session.state.targetPeerId)
++        let targetThreadId = session.state.targetThreadId
++        return hboltCleanSaveChunk(account: account, sourcePeerId: sourcePeerId, toPeerId: targetPeerId, toThreadId: targetThreadId, ids: chunkIds)
+         |> mapToSignal { result -> Signal<Never, NoError> in
+             // Advance the durable queue atomically: drop the processed chunk, fold in its outcome.
+             session.state.pending.removeFirst(take)
+@@ -1118,7 +1120,7 @@ private func hboltCleanSaveNeedsReupload(_ message: Message) -> Bool {
+ // Process one <=10-item chunk. Returns how many ended up actually present in Saved Messages
+ // (verified) vs refused by the server (rejected), and whether the server rejected anything on the
+ // fast reference path (drives backoff).
+-private func hboltCleanSaveChunk(account: Account, sourcePeerId: PeerId, ids: [Int32]) -> Signal<(verified: Int, rejected: Int, serverRejected: Bool), NoError> {
++private func hboltCleanSaveChunk(account: Account, sourcePeerId: PeerId, toPeerId: PeerId, toThreadId: Int64?, ids: [Int32]) -> Signal<(verified: Int, rejected: Int, serverRejected: Bool), NoError> {
+     let messageIds = ids.map { MessageId(peerId: sourcePeerId, namespace: Namespaces.Message.Cloud, id: $0) }
+     // HBOLT 0059: re-fetch the chunk's messages FRESH from the cloud so their file references are
+     // valid. This makes the by-reference (no-download) album send reliable instead of failing on
+@@ -1156,10 +1158,7 @@ private func hboltCleanSaveChunk(account: Account, sourcePeerId: PeerId, ids: [I
+         // Each retry re-runs the full reference + re-upload path on only the remaining failures.
+         let maxRetries = 4
+         func withRetry(_ remaining: [Message], attempt: Int) -> Signal<[Message], NoError> {
+-            return hboltWaitForOnline(account: account)
+-            |> mapToSignal { _ -> Signal<[Message], NoError> in
+-                return hboltCleanSaveSendOnce(account: account, toPeerId: account.peerId, toThreadId: nil, messages: remaining)
+-            }
++            return hboltCleanSaveSendOnce(account: account, toPeerId: toPeerId, toThreadId: toThreadId, messages: remaining)
+             |> mapToSignal { failed -> Signal<[Message], NoError> in
+                 if failed.isEmpty || attempt >= maxRetries {
+                     return .single(failed)
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
+index 9f4eb62..b8c970b 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenMessageActions.swift
+@@ -411,7 +411,18 @@ extension PeerInfoScreenNode {
+         guard self.peerId.namespace != Namespaces.Peer.SecretChat else {
+             return
+         }
+-        HBOLTCleanSave.start(account: self.context.account, fromPeerId: self.peerId, fromThreadId: self.chatLocation.threadId)
++        // HBOLT 0061: pick ANY destination chat (pick yourself for Saved Messages).
++        let fromPeerId = self.peerId
++        let fromThreadId = self.chatLocation.threadId
++        let peerSelectionController = self.context.sharedContext.makePeerSelectionController(PeerSelectionControllerParams(context: self.context, updatedPresentationData: self.controller?.updatedPresentationData, filter: [.onlyWriteable, .excludeDisabled], hasFilters: true, multipleSelection: false, selectForumThreads: true))
++        peerSelectionController.peerSelected = { [weak self, weak peerSelectionController] peer, threadId in
++            guard let strongSelf = self else {
++                return
++            }
++            peerSelectionController?.dismiss()
++            HBOLTCleanSave.start(account: strongSelf.context.account, fromPeerId: fromPeerId, fromThreadId: fromThreadId, toPeerId: peer.id, toThreadId: threadId)
++        }
++        self.controller?.push(peerSelectionController)
+     }
+ 
+     // HBOLT 0060: manual Resume / Refresh — continue an unfinished Clean Save batch from where it
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayMediaGalleryContextMenu.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayMediaGalleryContextMenu.swift
+index 7b7c46f..025b5d0 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayMediaGalleryContextMenu.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenDisplayMediaGalleryContextMenu.swift
+@@ -346,7 +346,7 @@ extension PeerInfoScreenNode {
+                     a(.default)
+                     self?.hboltSonicBulkStart()
+                 })))
+-                items.append(.action(ContextMenuActionItem(text: "🫧 Clean Save All → Saved Messages", icon: { theme in
++                items.append(.action(ContextMenuActionItem(text: "🫧 Clean Save All (choose chat)", icon: { theme in
+                     return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Download"), color: theme.contextMenu.primaryColor)
+                 }, action: { [weak self] _, a in
+                     a(.default)

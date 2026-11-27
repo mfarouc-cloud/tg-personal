@@ -1,0 +1,73 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index 36bb19e..9036845 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -1058,33 +1058,51 @@ private func hboltWaitForOnline(account: Account) -> Signal<Void, NoError> {
+ private func hboltCleanSaveProcess(session: HBOLTCleanSaveSession) -> Signal<Never, NoError> {
+     let account = session.account
+ 
+-    func loop(backoff: Double) -> Signal<Never, NoError> {
++    let sourcePeerId = PeerId(session.state.sourcePeerId)
++    let targetPeerId = PeerId(session.state.targetPeerId)
++    let targetThreadId = session.state.targetThreadId
++    // HBOLT 0063: process several albums CONCURRENTLY instead of one after another. One-at-a-time was
++    // the main cause of the crawling speed; sending a window of albums in parallel multiplies the
++    // throughput while the per-chunk retry still guarantees nothing is dropped.
++    let parallelAlbums = 5
++
++    func loop() -> Signal<Never, NoError> {
+         if session.state.pending.isEmpty {
+             let s = session.state
+             session.teardown()
+             let text = "🫧 Clean Save done.\n✅ Verified in Saved: \(s.verified)\n⛔️ Rejected by Server: \(s.rejected)\n📦 Total captured: \(s.total)"
+             return hboltReportToSaved(account: account, targetPeerId: nil, text: text)
+         }
+-        let take = min(10, session.state.pending.count)
+-        let chunkIds = Array(session.state.pending.prefix(take))
+-        let sourcePeerId = PeerId(session.state.sourcePeerId)
+-        let targetPeerId = PeerId(session.state.targetPeerId)
+-        let targetThreadId = session.state.targetThreadId
+-        return hboltCleanSaveChunk(account: account, sourcePeerId: sourcePeerId, toPeerId: targetPeerId, toThreadId: targetThreadId, ids: chunkIds)
+-        |> mapToSignal { result -> Signal<Never, NoError> in
+-            // Advance the durable queue atomically: drop the processed chunk, fold in its outcome.
+-            session.state.pending.removeFirst(take)
+-            session.state.verified += result.verified
+-            session.state.rejected += result.rejected
++        let windowSize = min(parallelAlbums * 10, session.state.pending.count)
++        let windowIds = Array(session.state.pending.prefix(windowSize))
++        var chunkSignals: [Signal<(verified: Int, rejected: Int, serverRejected: Bool), NoError>] = []
++        var start = 0
++        while start < windowIds.count {
++            let upper = min(start + 10, windowIds.count)
++            let chunkIds = Array(windowIds[start ..< upper])
++            chunkSignals.append(hboltCleanSaveChunk(account: account, sourcePeerId: sourcePeerId, toPeerId: targetPeerId, toThreadId: targetThreadId, ids: chunkIds))
++            start = upper
++        }
++        if chunkSignals.isEmpty {
++            session.state.pending.removeFirst(windowSize)
+             session.persist()
+-            // Bounded pacing: ease off when the server is rejecting/flooding, speed up when it is calm.
+-            let nextBackoff = result.serverRejected ? min(backoff * 1.7 + 0.6, 20.0) : max(0.25, backoff * 0.5)
+-            let wait: Signal<Never, NoError> = (Signal<Void, NoError>.single(Void()) |> delay(nextBackoff, queue: hboltBulkWorkQueue)) |> ignoreValues
+-            return wait |> then(loop(backoff: nextBackoff))
++            return loop()
++        }
++        return combineLatest(chunkSignals)
++        |> take(1)
++        |> mapToSignal { results -> Signal<Never, NoError> in
++            // Advance the durable queue by the whole window and fold in every chunk's outcome.
++            session.state.pending.removeFirst(windowSize)
++            for result in results {
++                session.state.verified += result.verified
++                session.state.rejected += result.rejected
++            }
++            session.persist()
++            return loop()
+         }
+     }
+ 
+-    return loop(backoff: 0.25)
++    return loop()
+ }
+ 
+ // Clean a source message's attributes for a permanent, provenance-free copy in Saved Messages.

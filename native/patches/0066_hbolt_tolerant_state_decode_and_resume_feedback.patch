@@ -1,0 +1,90 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index 9d7e94c..222cf67 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -844,12 +844,15 @@ public enum HBOLTCleanSave {
+ 
+ private func hboltCleanSaveResumeForced(account: Account) {
+     let accountId = account.peerId.toInt64()
+-    guard let state = HBOLTCleanSaveStore.load(accountId: accountId), !state.pending.isEmpty else {
++    guard let state = HBOLTCleanSaveStore.load(accountId: accountId), !(state.pending.isEmpty && state.retryPending.isEmpty) else {
++        // Always give the user a signal that the button did something.
++        hboltCleanSaveRuns.add(hboltReportToSaved(account: account, targetPeerId: nil, text: "🔄 Resume: no unfinished Clean Save to continue.").start())
+         return
+     }
+     let disposable = hboltCleanSaveBeginFresh(accountId)
+     let session = HBOLTCleanSaveSession(account: account, state: state)
+-    let work = hboltReportToSaved(account: account, targetPeerId: nil, text: "🔄 Clean Save resumed: \(state.pending.count) of \(state.total) item(s) left.")
++    let remaining = state.pending.count + state.retryPending.count
++    let work = hboltReportToSaved(account: account, targetPeerId: nil, text: "🔄 Clean Save resumed: continuing \(remaining) item(s) from where it stopped.")
+     |> then(hboltCleanSaveProcess(session: session))
+     disposable.set((work
+     |> afterDisposed {
+@@ -863,20 +866,53 @@ private struct HBOLTCleanSaveState: Codable {
+     let accountId: Int64
+     let sourcePeerId: Int64
+     let threadId: Int64?
+-    // HBOLT 0061: where the media is saved/forwarded to (defaults to the account's Saved Messages).
+     let targetPeerId: Int64
+     let targetThreadId: Int64?
+     var pending: [Int32]
+-    // HBOLT 0064: items that failed a pass are re-queued here and retried in extra whole-queue passes
+-    // (zero loss over speed) before any are finally reported as rejected.
+     var retryPending: [Int32]
+     var passCount: Int
+-    // HBOLT 0065: the failure count of the previous pass, to detect when retrying stops making
+-    // progress (the only thing left is media deleted from the source).
+     var lastFailedCount: Int
+     var verified: Int
+     var rejected: Int
+     let total: Int
++
++    init(accountId: Int64, sourcePeerId: Int64, threadId: Int64?, targetPeerId: Int64, targetThreadId: Int64?, pending: [Int32], retryPending: [Int32], passCount: Int, lastFailedCount: Int, verified: Int, rejected: Int, total: Int) {
++        self.accountId = accountId
++        self.sourcePeerId = sourcePeerId
++        self.threadId = threadId
++        self.targetPeerId = targetPeerId
++        self.targetThreadId = targetThreadId
++        self.pending = pending
++        self.retryPending = retryPending
++        self.passCount = passCount
++        self.lastFailedCount = lastFailedCount
++        self.verified = verified
++        self.rejected = rejected
++        self.total = total
++    }
++
++    // HBOLT 0066: tolerant decode so a queue saved by an older build (before these fields existed)
++    // still loads and resumes, instead of failing to decode and silently losing the whole batch.
++    enum CodingKeys: String, CodingKey {
++        case accountId, sourcePeerId, threadId, targetPeerId, targetThreadId, pending, retryPending, passCount, lastFailedCount, verified, rejected, total
++    }
++
++    init(from decoder: Decoder) throws {
++        let c = try decoder.container(keyedBy: CodingKeys.self)
++        self.accountId = try c.decode(Int64.self, forKey: .accountId)
++        self.sourcePeerId = try c.decode(Int64.self, forKey: .sourcePeerId)
++        self.threadId = try c.decodeIfPresent(Int64.self, forKey: .threadId)
++        let account = self.accountId
++        self.targetPeerId = (try c.decodeIfPresent(Int64.self, forKey: .targetPeerId)) ?? account
++        self.targetThreadId = try c.decodeIfPresent(Int64.self, forKey: .targetThreadId)
++        self.pending = (try c.decodeIfPresent([Int32].self, forKey: .pending)) ?? []
++        self.retryPending = (try c.decodeIfPresent([Int32].self, forKey: .retryPending)) ?? []
++        self.passCount = (try c.decodeIfPresent(Int.self, forKey: .passCount)) ?? 0
++        self.lastFailedCount = (try c.decodeIfPresent(Int.self, forKey: .lastFailedCount)) ?? -1
++        self.verified = (try c.decodeIfPresent(Int.self, forKey: .verified)) ?? 0
++        self.rejected = (try c.decodeIfPresent(Int.self, forKey: .rejected)) ?? 0
++        self.total = (try c.decodeIfPresent(Int.self, forKey: .total)) ?? (self.pending.count + self.retryPending.count)
++    }
+ }
+ 
+ private enum HBOLTCleanSaveStore {
+@@ -1027,7 +1063,7 @@ private func hboltCleanSaveStartRun(account: Account, fromPeerId: PeerId, fromTh
+ 
+ private func hboltCleanSaveResume(account: Account) {
+     let accountId = account.peerId.toInt64()
+-    guard let state = HBOLTCleanSaveStore.load(accountId: accountId), !state.pending.isEmpty else {
++    guard let state = HBOLTCleanSaveStore.load(accountId: accountId), !(state.pending.isEmpty && state.retryPending.isEmpty) else {
+         HBOLTCleanSaveStore.clear(accountId: accountId)
+         return
+     }

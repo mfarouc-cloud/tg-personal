@@ -1,0 +1,18 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index 4bddea9..36bb19e 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -1172,6 +1172,13 @@ private func hboltCleanSaveChunk(account: Account, sourcePeerId: PeerId, toPeerI
+         }
+         return withRetry(valid, attempt: 0)
+         |> map { finallyFailed -> (verified: Int, rejected: Int, serverRejected: Bool) in
++            // HBOLT 0062: free this chunk's downloaded media from the cache as soon as it is sent, so
++            // a huge run (tens of thousands of videos) never fills the device. Fire-and-forget; the
++            // detached temp copies used for re-upload delete themselves once sent.
++            let resourceIds = valid.compactMap { hboltSonicResourceId($0) }
++            if !resourceIds.isEmpty {
++                hboltSonicCleanup.add((account.postbox.mediaBox.removeCachedResources(resourceIds, force: true) |> ignoreValues).start())
++            }
+             let rejected = missing + finallyFailed.count
+             let verified = valid.count - finallyFailed.count
+             return (verified: verified, rejected: rejected, serverRejected: rejected > 0)
