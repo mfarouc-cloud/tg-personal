@@ -1,0 +1,127 @@
+diff --git a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+index 9036845..ef5f609 100644
+--- a/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
++++ b/submodules/TelegramCore/Sources/HBOLTBulkForward.swift
+@@ -867,6 +867,10 @@ private struct HBOLTCleanSaveState: Codable {
+     let targetPeerId: Int64
+     let targetThreadId: Int64?
+     var pending: [Int32]
++    // HBOLT 0064: items that failed a pass are re-queued here and retried in extra whole-queue passes
++    // (zero loss over speed) before any are finally reported as rejected.
++    var retryPending: [Int32]
++    var passCount: Int
+     var verified: Int
+     var rejected: Int
+     let total: Int
+@@ -1006,7 +1010,7 @@ private func hboltCleanSaveStartRun(account: Account, fromPeerId: PeerId, fromTh
+         if ids.isEmpty {
+             return hboltReportToSaved(account: account, targetPeerId: nil, text: "🫧 Clean Save: no photos or videos found here.")
+         }
+-        let state = HBOLTCleanSaveState(accountId: accountId, sourcePeerId: fromPeerId.toInt64(), threadId: fromThreadId, targetPeerId: toPeerId.toInt64(), targetThreadId: toThreadId, pending: ids, verified: 0, rejected: 0, total: ids.count)
++        let state = HBOLTCleanSaveState(accountId: accountId, sourcePeerId: fromPeerId.toInt64(), threadId: fromThreadId, targetPeerId: toPeerId.toInt64(), targetThreadId: toThreadId, pending: ids, retryPending: [], passCount: 0, verified: 0, rejected: 0, total: ids.count)
+         HBOLTCleanSaveStore.save(state)
+         let session = HBOLTCleanSaveSession(account: account, state: state)
+         return hboltReportToSaved(account: account, targetPeerId: nil, text: "🫧 Clean Save started: \(ids.count) item(s) queued. You can leave this chat — saving continues in the background.")
+@@ -1066,16 +1070,30 @@ private func hboltCleanSaveProcess(session: HBOLTCleanSaveSession) -> Signal<Nev
+     // throughput while the per-chunk retry still guarantees nothing is dropped.
+     let parallelAlbums = 5
+ 
++    let maxPasses = 4
+     func loop() -> Signal<Never, NoError> {
+         if session.state.pending.isEmpty {
+-            let s = session.state
++            // A pass finished. Anything still failing gets another whole-queue pass (zero loss),
++            // bounded so a genuinely-gone item (deleted on the server) can't loop forever.
++            let stillFailed = Array(Set(session.state.retryPending))
++            if !stillFailed.isEmpty && session.state.passCount < maxPasses {
++                session.state.pending = stillFailed.sorted()
++                session.state.retryPending = []
++                session.state.passCount += 1
++                session.persist()
++                let pass = session.state.passCount
++                return hboltReportToSaved(account: account, targetPeerId: nil, text: "🔁 Clean Save retry pass \(pass): \(stillFailed.count) item(s) that didn't go through yet.")
++                |> then(loop())
++            }
++            let failed = stillFailed.count
++            let verified = session.state.total - failed
+             session.teardown()
+-            let text = "🫧 Clean Save done.\n✅ Verified in Saved: \(s.verified)\n⛔️ Rejected by Server: \(s.rejected)\n📦 Total captured: \(s.total)"
++            let text = "🫧 Clean Save done.\n✅ Verified in Saved: \(verified)\n⛔️ Could not save: \(failed)\n📦 Total captured: \(session.state.total)"
+             return hboltReportToSaved(account: account, targetPeerId: nil, text: text)
+         }
+         let windowSize = min(parallelAlbums * 10, session.state.pending.count)
+         let windowIds = Array(session.state.pending.prefix(windowSize))
+-        var chunkSignals: [Signal<(verified: Int, rejected: Int, serverRejected: Bool), NoError>] = []
++        var chunkSignals: [Signal<(rejectedIds: [Int32], serverRejected: Bool), NoError>] = []
+         var start = 0
+         while start < windowIds.count {
+             let upper = min(start + 10, windowIds.count)
+@@ -1091,11 +1109,10 @@ private func hboltCleanSaveProcess(session: HBOLTCleanSaveSession) -> Signal<Nev
+         return combineLatest(chunkSignals)
+         |> take(1)
+         |> mapToSignal { results -> Signal<Never, NoError> in
+-            // Advance the durable queue by the whole window and fold in every chunk's outcome.
++            // Advance the durable queue by the whole window; re-queue every item that did not save.
+             session.state.pending.removeFirst(windowSize)
+             for result in results {
+-                session.state.verified += result.verified
+-                session.state.rejected += result.rejected
++                session.state.retryPending.append(contentsOf: result.rejectedIds)
+             }
+             session.persist()
+             return loop()
+@@ -1138,7 +1155,7 @@ private func hboltCleanSaveNeedsReupload(_ message: Message) -> Bool {
+ // Process one <=10-item chunk. Returns how many ended up actually present in Saved Messages
+ // (verified) vs refused by the server (rejected), and whether the server rejected anything on the
+ // fast reference path (drives backoff).
+-private func hboltCleanSaveChunk(account: Account, sourcePeerId: PeerId, toPeerId: PeerId, toThreadId: Int64?, ids: [Int32]) -> Signal<(verified: Int, rejected: Int, serverRejected: Bool), NoError> {
++private func hboltCleanSaveChunk(account: Account, sourcePeerId: PeerId, toPeerId: PeerId, toThreadId: Int64?, ids: [Int32]) -> Signal<(rejectedIds: [Int32], serverRejected: Bool), NoError> {
+     let messageIds = ids.map { MessageId(peerId: sourcePeerId, namespace: Namespaces.Message.Cloud, id: $0) }
+     // HBOLT 0059: re-fetch the chunk's messages FRESH from the cloud so their file references are
+     // valid. This makes the by-reference (no-download) album send reliable instead of failing on
+@@ -1161,16 +1178,16 @@ private func hboltCleanSaveChunk(account: Account, sourcePeerId: PeerId, toPeerI
+         return f.isEmpty ? localLoad : .single(f)
+     }
+     |> timeout(90.0, queue: hboltBulkWorkQueue, alternate: localLoad)
+-    |> mapToSignal { messages -> Signal<(verified: Int, rejected: Int, serverRejected: Bool), NoError> in
++    |> mapToSignal { messages -> Signal<(rejectedIds: [Int32], serverRejected: Bool), NoError> in
+         let valid = messages.filter { message in
+             message.media.contains(where: { $0 is TelegramMediaImage || (($0 as? TelegramMediaFile)?.isVideo ?? false) })
+         }
+         if valid.isEmpty {
+-            // Nothing selectable in this chunk (deleted, or no longer photo/video): count as rejected
+-            // so the totals still add up to the captured count.
+-            return .single((verified: 0, rejected: ids.count, serverRejected: false))
++            // Nothing loadable right now (evicted / transient): re-queue them all for a later pass.
++            return .single((rejectedIds: ids, serverRejected: false))
+         }
+-        let missing = ids.count - valid.count
++        let validIds = Set(valid.map { $0.id.id })
++        let missingIds = ids.filter { !validIds.contains($0) }
+         // HBOLT 0054: retry whatever still failed a few times before giving up, so a transient issue
+         // (a momentary flood/network error, a download that stalled once) does not count as rejected.
+         // Each retry re-runs the full reference + re-upload path on only the remaining failures.
+@@ -1189,17 +1206,16 @@ private func hboltCleanSaveChunk(account: Account, sourcePeerId: PeerId, toPeerI
+             }
+         }
+         return withRetry(valid, attempt: 0)
+-        |> map { finallyFailed -> (verified: Int, rejected: Int, serverRejected: Bool) in
+-            // HBOLT 0062: free this chunk's downloaded media from the cache as soon as it is sent, so
+-            // a huge run (tens of thousands of videos) never fills the device. Fire-and-forget; the
+-            // detached temp copies used for re-upload delete themselves once sent.
++        |> map { finallyFailed -> (rejectedIds: [Int32], serverRejected: Bool) in
++            // HBOLT 0062: free this chunk's downloaded media from the cache as soon as it is sent.
+             let resourceIds = valid.compactMap { hboltSonicResourceId($0) }
+             if !resourceIds.isEmpty {
+                 hboltSonicCleanup.add((account.postbox.mediaBox.removeCachedResources(resourceIds, force: true) |> ignoreValues).start())
+             }
+-            let rejected = missing + finallyFailed.count
+-            let verified = valid.count - finallyFailed.count
+-            return (verified: verified, rejected: rejected, serverRejected: rejected > 0)
++            // HBOLT 0064: anything not saved (missing now + failed after retries) is returned so it can
++            // be re-queued for another whole-queue pass — never silently dropped.
++            let rejectedIds = missingIds + finallyFailed.map { $0.id.id }
++            return (rejectedIds: rejectedIds, serverRejected: !rejectedIds.isEmpty)
+         }
+     }
+ }
